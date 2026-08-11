@@ -6,7 +6,6 @@ List<CameraDescription> cameras = [];
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  // ¡No pedir permisos aquí! El motor Flutter debe iniciar la UI primero.
   runApp(const CamoCloneApp());
 }
 
@@ -36,7 +35,20 @@ class CameraScreen extends StatefulWidget {
 
 class _CameraScreenState extends State<CameraScreen> {
   CameraController? _controller;
+  CameraDescription? _selectedCamera;
   bool _isReady = false;
+  bool _isFocusLocked = false;
+
+  double _currentZoom = 1.0;
+  double _minZoom = 1.0;
+  double _maxZoom = 1.0;
+  
+  double _currentExposure = 0.0;
+  double _minExposure = 0.0;
+  double _maxExposure = 0.0;
+  
+  ResolutionPreset _currentResolution = ResolutionPreset.veryHigh;
+  int _currentFps = 30;
 
   @override
   void initState() {
@@ -45,7 +57,6 @@ class _CameraScreenState extends State<CameraScreen> {
   }
 
   Future<void> _initializeApp() async {
-    // 1. Pedir permisos cuando la pantalla ya está activa
     await [
       Permission.camera,
       Permission.microphone,
@@ -53,7 +64,6 @@ class _CameraScreenState extends State<CameraScreen> {
       Permission.bluetoothConnect,
     ].request();
 
-    // 2. Obtener cámaras
     try {
       cameras = await availableCameras();
       _initCamera();
@@ -62,24 +72,37 @@ class _CameraScreenState extends State<CameraScreen> {
     }
   }
 
-  Future<void> _initCamera() async {
+  Future<void> _initCamera([CameraDescription? camera]) async {
     if (cameras.isEmpty) return;
     
-    // Seleccionamos la cámara trasera por defecto
-    final camera = cameras.firstWhere(
+    // Si hay un controlador anterior, lo descartamos
+    await _controller?.dispose();
+    
+    // Elegir cámara proporcionada, o la primera trasera por defecto
+    _selectedCamera = camera ?? cameras.firstWhere(
       (c) => c.lensDirection == CameraLensDirection.back,
       orElse: () => cameras.first,
     );
 
-    // ResolutionPreset.max fuerza la máxima resolución posible (1080p o 4K)
     _controller = CameraController(
-      camera,
-      ResolutionPreset.max, 
+      _selectedCamera!,
+      _currentResolution, 
       enableAudio: false,
     );
 
     try {
       await _controller!.initialize();
+      
+      _minZoom = await _controller!.getMinZoomLevel();
+      _maxZoom = await _controller!.getMaxZoomLevel();
+      _minExposure = await _controller!.getMinExposureOffset();
+      _maxExposure = await _controller!.getMaxExposureOffset();
+      
+      // Reiniciamos variables de UI
+      _currentZoom = 1.0;
+      _currentExposure = 0.0;
+      _isFocusLocked = false;
+
       if (mounted) {
         setState(() {
           _isReady = true;
@@ -96,19 +119,220 @@ class _CameraScreenState extends State<CameraScreen> {
     super.dispose();
   }
 
+  void _showSettingsPanel() {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: Colors.black87,
+      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(20))),
+      builder: (context) {
+        return StatefulBuilder(
+          builder: (context, setModalState) {
+            return Padding(
+              padding: const EdgeInsets.all(24.0),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Text("Ajustes de Cámara", style: TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold)),
+                  const SizedBox(height: 20),
+                  
+                  // LENTE (SELECCIÓN DE CÁMARA MULTIPLE)
+                  Row(
+                    children: [
+                      const Icon(Icons.camera_alt, color: Colors.white),
+                      const SizedBox(width: 10),
+                      const Text("Lente:", style: TextStyle(color: Colors.white)),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: DropdownButton<CameraDescription>(
+                          dropdownColor: Colors.black87,
+                          isExpanded: true,
+                          value: _selectedCamera,
+                          style: const TextStyle(color: Colors.white),
+                          items: cameras.map((c) {
+                            // En Android los nombres suelen ser 0, 1, 2, 3
+                            String lensName = "Lente ${c.name} (${c.lensDirection.name})";
+                            return DropdownMenuItem(
+                              value: c,
+                              child: Text(lensName, overflow: TextOverflow.ellipsis),
+                            );
+                          }).toList(),
+                          onChanged: (newCamera) async {
+                            if (newCamera != null && newCamera != _selectedCamera) {
+                              Navigator.pop(context); // Cerramos el panel
+                              setState(() {
+                                _isReady = false; // Pantalla de carga
+                              });
+                              await _initCamera(newCamera); // Cargamos nuevo lente
+                            }
+                          },
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 10),
+                  
+                  // Calidad de Video (Resolución)
+                  Row(
+                    children: [
+                      const Icon(Icons.hd, color: Colors.white),
+                      const SizedBox(width: 10),
+                      const Text("Calidad:", style: TextStyle(color: Colors.white)),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: DropdownButton<ResolutionPreset>(
+                          dropdownColor: Colors.black87,
+                          isExpanded: true,
+                          value: _currentResolution,
+                          style: const TextStyle(color: Colors.white),
+                          items: ResolutionPreset.values.map((preset) {
+                            return DropdownMenuItem(
+                              value: preset,
+                              child: Text(preset.name.toUpperCase()),
+                            );
+                          }).toList(),
+                          onChanged: (newPreset) async {
+                            if (newPreset != null && newPreset != _currentResolution) {
+                              Navigator.pop(context);
+                              setState(() {
+                                _currentResolution = newPreset;
+                                _isReady = false;
+                              });
+                              await _initCamera(_selectedCamera);
+                            }
+                          },
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 10),
+
+                  // Velocidad (FPS) - Se aplicará en el motor WebRTC
+                  Row(
+                    children: [
+                      const Icon(Icons.speed, color: Colors.white),
+                      const SizedBox(width: 10),
+                      const Text("FPS:", style: TextStyle(color: Colors.white)),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: DropdownButton<int>(
+                          dropdownColor: Colors.black87,
+                          isExpanded: true,
+                          value: _currentFps,
+                          style: const TextStyle(color: Colors.white),
+                          items: [24, 30, 60].map((fps) {
+                            return DropdownMenuItem(
+                              value: fps,
+                              child: Text("$fps FPS"),
+                            );
+                          }).toList(),
+                          onChanged: (newFps) {
+                            if (newFps != null) {
+                              setModalState(() {
+                                _currentFps = newFps;
+                              });
+                            }
+                          },
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 10),
+                  
+                  // Slider de Zoom
+                  Row(
+                    children: [
+                      const Icon(Icons.zoom_in, color: Colors.white),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: Slider(
+                          value: _currentZoom,
+                          min: _minZoom,
+                          max: _maxZoom,
+                          activeColor: Colors.blueAccent,
+                          onChanged: (value) async {
+                            setModalState(() => _currentZoom = value);
+                            await _controller?.setZoomLevel(value);
+                          },
+                        ),
+                      ),
+                      SizedBox(
+                        width: 40, 
+                        child: Text("${_currentZoom.toStringAsFixed(1)}x", style: const TextStyle(color: Colors.white))
+                      ),
+                    ],
+                  ),
+                  
+                  // Slider de Exposición (Brillo)
+                  Row(
+                    children: [
+                      const Icon(Icons.brightness_6, color: Colors.white),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: Slider(
+                          value: _currentExposure,
+                          min: _minExposure,
+                          max: _maxExposure,
+                          activeColor: Colors.amber,
+                          onChanged: (value) async {
+                            setModalState(() => _currentExposure = value);
+                            await _controller?.setExposureOffset(value);
+                          },
+                        ),
+                      ),
+                      SizedBox(
+                        width: 40,
+                        child: Text(
+                          "${_currentExposure > 0 ? '+' : ''}${_currentExposure.toStringAsFixed(1)}",
+                          style: const TextStyle(color: Colors.white)
+                        ),
+                      ),
+                    ],
+                  ),
+                  
+                  // Toggle Enfoque
+                  const SizedBox(height: 10),
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      const Row(
+                        children: [
+                          Icon(Icons.center_focus_strong, color: Colors.white),
+                          SizedBox(width: 10),
+                          Text("Bloquear Enfoque", style: TextStyle(color: Colors.white)),
+                        ],
+                      ),
+                      Switch(
+                        value: _isFocusLocked,
+                        activeColor: Colors.redAccent,
+                        onChanged: (value) async {
+                          setState(() {
+                            _isFocusLocked = value;
+                          });
+                          setModalState(() {});
+                          await _controller?.setFocusMode(
+                            value ? FocusMode.locked : FocusMode.auto,
+                          );
+                        },
+                      )
+                    ],
+                  ),
+                  
+                  const SizedBox(height: 20),
+                ],
+              ),
+            );
+          }
+        );
+      }
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     if (!_isReady || _controller == null || !_controller!.value.isInitialized) {
       return const Scaffold(
         body: Center(
-          child: Column(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              CircularProgressIndicator(color: Colors.white),
-              SizedBox(height: 20),
-              Text("Iniciando cámara...", style: TextStyle(color: Colors.white)),
-            ],
-          ),
+          child: CircularProgressIndicator(color: Colors.white),
         ),
       );
     }
@@ -117,27 +341,46 @@ class _CameraScreenState extends State<CameraScreen> {
       body: Stack(
         fit: StackFit.expand,
         children: [
-          // Visor de Cámara a pantalla completa
-          CameraPreview(_controller!),
+          LayoutBuilder(
+            builder: (context, constraints) {
+              final scale = 1 / (_controller!.value.aspectRatio * constraints.maxHeight / constraints.maxWidth);
+              return GestureDetector(
+                behavior: HitTestBehavior.opaque,
+                onTapDown: (details) {
+                  if (_controller == null || _isFocusLocked) return;
+                  final x = details.localPosition.dx / constraints.maxWidth;
+                  final y = details.localPosition.dy / constraints.maxHeight;
+                  _controller!.setFocusPoint(Offset(x, y));
+                },
+                child: Center(
+                  child: AspectRatio(
+                    // Flutter en vertical requiere invertir el aspect ratio
+                    aspectRatio: 1 / _controller!.value.aspectRatio,
+                    child: CameraPreview(_controller!),
+                  ),
+                ),
+              );
+            }
+          ),
           
-          // Capa de Interfaz de Usuario (UI Overlay)
           SafeArea(
             child: Column(
               mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: [
-                // Barra Superior (Estados)
                 Padding(
                   padding: const EdgeInsets.all(16.0),
                   child: Row(
                     mainAxisAlignment: MainAxisAlignment.spaceBetween,
                     children: [
                       _buildStatusChip(Icons.wifi, "OBS: Desc"),
-                      _buildStatusChip(Icons.bluetooth, "ESP32: OFF"),
+                      _buildStatusChip(
+                        _isFocusLocked ? Icons.lock : Icons.center_focus_weak, 
+                        _isFocusLocked ? "Enfoque: FIJO" : "Enfoque: AUTO",
+                        color: _isFocusLocked ? Colors.redAccent : Colors.black54
+                      ),
                     ],
                   ),
                 ),
-                
-                // Barra Inferior (Controles)
                 Container(
                   padding: const EdgeInsets.all(24.0),
                   decoration: const BoxDecoration(
@@ -152,20 +395,16 @@ class _CameraScreenState extends State<CameraScreen> {
                     children: [
                       IconButton(
                         icon: const Icon(Icons.settings, color: Colors.white, size: 30),
-                        onPressed: () {},
+                        onPressed: _showSettingsPanel,
                       ),
                       FloatingActionButton(
                         backgroundColor: Colors.redAccent,
-                        onPressed: () {
-                          // TODO: Iniciar Transmisión WebRTC a OBS
-                        },
+                        onPressed: () {},
                         child: const Icon(Icons.live_tv, color: Colors.white),
                       ),
                       IconButton(
                         icon: const Icon(Icons.gamepad, color: Colors.white, size: 30),
-                        onPressed: () {
-                          // TODO: Abrir panel de control de Motores
-                        },
+                        onPressed: () {},
                       ),
                     ],
                   ),
@@ -178,11 +417,11 @@ class _CameraScreenState extends State<CameraScreen> {
     );
   }
 
-  Widget _buildStatusChip(IconData icon, String text) {
+  Widget _buildStatusChip(IconData icon, String text, {Color color = Colors.black54}) {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
       decoration: BoxDecoration(
-        color: Colors.black54,
+        color: color,
         borderRadius: BorderRadius.circular(20),
       ),
       child: Row(
