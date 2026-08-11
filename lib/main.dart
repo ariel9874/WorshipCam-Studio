@@ -2,7 +2,9 @@ import 'package:flutter/material.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:network_info_plus/network_info_plus.dart';
-import 'signaling/local_server.dart';
+import 'package:flutter/foundation.dart';
+import 'signaling/local_server_stub.dart' if (dart.library.io) 'signaling/local_server.dart';
+import 'remote_control_screen.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -20,7 +22,9 @@ class CamoCloneApp extends StatelessWidget {
         primaryColor: Colors.blueAccent,
         scaffoldBackgroundColor: Colors.black,
       ),
-      home: const CameraScreen(),
+      home: (kIsWeb || (!kIsWeb && (defaultTargetPlatform == TargetPlatform.windows || defaultTargetPlatform == TargetPlatform.macOS || defaultTargetPlatform == TargetPlatform.linux))) 
+          ? const RemoteControlScreen() 
+          : const CameraScreen(),
       debugShowCheckedModeBanner: false,
     );
   }
@@ -173,6 +177,38 @@ class _CameraScreenState extends State<CameraScreen> {
           message['candidate']['sdpMLineIndex'],
         );
         await _peerConnection?.addCandidate(candidate);
+      } else if (type == 'switch_lens') {
+        if (_cameras.isNotEmpty && _selectedCamera != null) {
+          int currentIndex = _cameras.indexOf(_selectedCamera!);
+          int nextIndex = (currentIndex + 1) % _cameras.length;
+          setState(() {
+            _selectedCamera = _cameras[nextIndex];
+            _isReady = false;
+          });
+          await _initCamera(_selectedCamera);
+        }
+      } else if (type == 'set_resolution') {
+        final val = message['value'];
+        ResolutionPreset preset = ResolutionPreset.veryHigh;
+        if (val == 'high') preset = ResolutionPreset.high;
+        if (val == 'max') preset = ResolutionPreset.max;
+        
+        if (preset != _currentResolution) {
+          setState(() {
+            _currentResolution = preset;
+            _isReady = false;
+          });
+          await _initCamera(_selectedCamera);
+        }
+      } else if (type == 'set_fps') {
+        final fps = (message['value'] is int) ? message['value'] : int.tryParse(message['value'].toString()) ?? 30;
+        if (fps != _currentFps) {
+          setState(() {
+            _currentFps = fps;
+            _isReady = false;
+          });
+          await _initCamera(_selectedCamera);
+        }
       }
     };
 

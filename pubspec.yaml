@@ -42,6 +42,7 @@ dependencies:
   shelf_web_socket: ^3.0.0
   shelf_router: ^1.1.4
   network_info_plus: ^8.2.1
+  web_socket_channel: ^3.0.3
 
 dev_dependencies:
   flutter_test:

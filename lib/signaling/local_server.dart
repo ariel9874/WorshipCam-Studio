@@ -40,6 +40,18 @@ class LocalSignalingServer {
       });
     }));
 
+    // 3. Ruta WebSocket para el Control Remoto (App de Windows)
+    router.get('/control', webSocketHandler((webSocket, protocol) {
+      debugPrint("Control Remoto de Windows conectado!");
+      
+      webSocket.stream.listen((message) {
+        final data = jsonDecode(message);
+        onMessageReceived?.call(data);
+      }, onDone: () {
+        debugPrint("Control Remoto desconectado");
+      });
+    }));
+
     // Iniciar el servidor escuchando en todas las interfaces de red (0.0.0.0)
     await io.serve(router.call, '0.0.0.0', port);
     debugPrint('Servidor Local corriendo en puerto $port');
