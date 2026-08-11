@@ -1,8 +1,8 @@
 import 'package:flutter/material.dart';
-import 'package:camera/camera.dart';
+import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:permission_handler/permission_handler.dart';
-
-List<CameraDescription> cameras = [];
+import 'package:network_info_plus/network_info_plus.dart';
+import 'signaling/local_server.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -33,20 +33,24 @@ class CameraScreen extends StatefulWidget {
   State<CameraScreen> createState() => _CameraScreenState();
 }
 
-class _CameraScreenState extends State<CameraScreen> {
-  CameraController? _controller;
-  CameraDescription? _selectedCamera;
-  bool _isReady = false;
-  bool _isFocusLocked = false;
+enum ResolutionPreset { low, medium, high, veryHigh, ultraHigh, max }
 
-  double _currentZoom = 1.0;
-  double _minZoom = 1.0;
-  double _maxZoom = 1.0;
+class _CameraScreenState extends State<CameraScreen> {
+  // WebRTC
+  final RTCVideoRenderer _localRenderer = RTCVideoRenderer();
+  MediaStream? _localStream;
+  RTCPeerConnection? _peerConnection;
   
-  double _currentExposure = 0.0;
-  double _minExposure = 0.0;
-  double _maxExposure = 0.0;
+  // Servidor Local
+  LocalSignalingServer? _signalingServer;
+  String _localIp = "Obteniendo IP...";
+  bool _isStreaming = false;
+  bool _isObsConnected = false;
   
+  // UI State
+  bool _isReady = false;
+  List<MediaDeviceInfo> _cameras = [];
+  MediaDeviceInfo? _selectedCamera;
   ResolutionPreset _currentResolution = ResolutionPreset.veryHigh;
   int _currentFps = 30;
 
@@ -65,43 +69,73 @@ class _CameraScreenState extends State<CameraScreen> {
     ].request();
 
     try {
-      cameras = await availableCameras();
-      _initCamera();
-    } on CameraException catch (e) {
-      debugPrint('Error obteniendo cámaras: $e');
+      await _localRenderer.initialize();
+      // En WebRTC, pedimos la lista de dispositivos
+      final devices = await navigator.mediaDevices.enumerateDevices();
+      _cameras = devices.where((d) => d.kind == 'videoinput').toList();
+      
+      await _initCamera();
+      await _initSignalingServer();
+      
+      // Obtener IP local para mostrar al usuario
+      final ip = await NetworkInfo().getWifiIP();
+      setState(() {
+        _localIp = ip ?? "127.0.0.1";
+      });
+      
+    } catch (e) {
+      debugPrint('Error inicializando: $e');
     }
   }
 
-  Future<void> _initCamera([CameraDescription? camera]) async {
-    if (cameras.isEmpty) return;
+  Future<void> _initCamera([MediaDeviceInfo? camera]) async {
+    _selectedCamera = camera ?? (_cameras.isNotEmpty ? _cameras.first : null);
     
-    // Si hay un controlador anterior, lo descartamos
-    await _controller?.dispose();
-    
-    // Elegir cámara proporcionada, o la primera trasera por defecto
-    _selectedCamera = camera ?? cameras.firstWhere(
-      (c) => c.lensDirection == CameraLensDirection.back,
-      orElse: () => cameras.first,
-    );
+    // Si ya había un stream, detenerlo para cambiar de cámara
+    if (_localStream != null) {
+      _localStream!.getTracks().forEach((track) => track.stop());
+    }
 
-    _controller = CameraController(
-      _selectedCamera!,
-      _currentResolution, 
-      enableAudio: false,
-    );
+    String minWidth = '1280';
+    String minHeight = '720';
+    if (_currentResolution == ResolutionPreset.max || _currentResolution == ResolutionPreset.ultraHigh || _currentResolution == ResolutionPreset.veryHigh) {
+      minWidth = '1920';
+      minHeight = '1080';
+    } else if (_currentResolution == ResolutionPreset.high) {
+      minWidth = '1280';
+      minHeight = '720';
+    } else {
+      minWidth = '640';
+      minHeight = '480';
+    }
+
+    final Map<String, dynamic> mediaConstraints = {
+      'audio': false,
+      'video': {
+        'mandatory': {
+          'minWidth': minWidth,
+          'minHeight': minHeight,
+          'minFrameRate': _currentFps.toString(),
+        },
+        'facingMode': 'environment',
+        'optional': _selectedCamera != null ? [{'sourceId': _selectedCamera!.deviceId}] : [],
+      }
+    };
 
     try {
-      await _controller!.initialize();
+      _localStream = await navigator.mediaDevices.getUserMedia(mediaConstraints);
+      _localRenderer.srcObject = _localStream;
       
-      _minZoom = await _controller!.getMinZoomLevel();
-      _maxZoom = await _controller!.getMaxZoomLevel();
-      _minExposure = await _controller!.getMinExposureOffset();
-      _maxExposure = await _controller!.getMaxExposureOffset();
-      
-      // Reiniciamos variables de UI
-      _currentZoom = 1.0;
-      _currentExposure = 0.0;
-      _isFocusLocked = false;
+      // Actualizar el stream en OBS si ya estábamos transmitiendo
+      if (_peerConnection != null && _isStreaming) {
+        final senders = await _peerConnection!.getSenders();
+        final videoTrack = _localStream!.getVideoTracks().first;
+        for (var sender in senders) {
+          if (sender.track?.kind == 'video') {
+            await sender.replaceTrack(videoTrack);
+          }
+        }
+      }
 
       if (mounted) {
         setState(() {
@@ -109,17 +143,140 @@ class _CameraScreenState extends State<CameraScreen> {
         });
       }
     } catch (e) {
-      debugPrint("Error inicializando cámara: $e");
+      debugPrint("Error iniciando cámara WebRTC: $e");
     }
+  }
+
+  Future<void> _initSignalingServer() async {
+    _signalingServer = LocalSignalingServer();
+    
+    _signalingServer!.onClientConnected = () {
+      setState(() => _isObsConnected = true);
+    };
+    
+    _signalingServer!.onClientDisconnected = () {
+      setState(() => _isObsConnected = false);
+      _peerConnection?.close();
+      _peerConnection = null;
+    };
+
+    _signalingServer!.onMessageReceived = (message) async {
+      final type = message['type'];
+      
+      if (type == 'answer') {
+        final answer = RTCSessionDescription(message['answer']['sdp'], message['answer']['type']);
+        await _peerConnection?.setRemoteDescription(answer);
+      } else if (type == 'candidate') {
+        final candidate = RTCIceCandidate(
+          message['candidate']['candidate'],
+          message['candidate']['sdpMid'],
+          message['candidate']['sdpMLineIndex'],
+        );
+        await _peerConnection?.addCandidate(candidate);
+      }
+    };
+
+    await _signalingServer!.start();
+  }
+
+  Future<void> _startWebRTCStream() async {
+    if (_localStream == null) return;
+
+    final configuration = {
+      'iceServers': [
+        {'urls': 'stun:stun.l.google.com:19302'}
+      ]
+    };
+
+    _peerConnection = await createPeerConnection(configuration);
+
+    _peerConnection!.onIceCandidate = (candidate) {
+      _signalingServer!.sendMessage({
+        'type': 'candidate',
+        'candidate': {
+          'candidate': candidate.candidate,
+          'sdpMid': candidate.sdpMid,
+          'sdpMLineIndex': candidate.sdpMLineIndex
+        }
+      });
+    };
+
+    _localStream!.getTracks().forEach((track) {
+      _peerConnection!.addTrack(track, _localStream!);
+    });
+
+    final offer = await _peerConnection!.createOffer();
+    await _peerConnection!.setLocalDescription(offer);
+
+    _signalingServer!.sendMessage({
+      'type': 'offer',
+      'offer': {
+        'type': offer.type,
+        'sdp': offer.sdp
+      }
+    });
+
+    setState(() {
+      _isStreaming = true;
+    });
+  }
+
+  void _stopWebRTCStream() {
+    _peerConnection?.close();
+    _peerConnection = null;
+    setState(() {
+      _isStreaming = false;
+    });
   }
 
   @override
   void dispose() {
-    _controller?.dispose();
+    _localRenderer.dispose();
+    _localStream?.getTracks().forEach((track) => track.stop());
+    _peerConnection?.close();
     super.dispose();
   }
 
+  void _showOBSInstructions() {
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        backgroundColor: Colors.black87,
+        title: const Text("Conectar a OBS", style: TextStyle(color: Colors.white)),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text("1. Abre OBS Studio en tu PC.", style: TextStyle(color: Colors.white)),
+            const SizedBox(height: 10),
+            const Text("2. Agrega una nueva fuente de tipo 'Navegador' (Browser Source).", style: TextStyle(color: Colors.white)),
+            const SizedBox(height: 10),
+            const Text("3. Desmarca 'Archivo Local' y pon esta URL:", style: TextStyle(color: Colors.white)),
+            const SizedBox(height: 10),
+            Container(
+              padding: const EdgeInsets.all(10),
+              color: Colors.black,
+              child: SelectableText("http://$_localIp:8080", style: const TextStyle(color: Colors.greenAccent, fontSize: 18, fontWeight: FontWeight.bold)),
+            ),
+            const SizedBox(height: 10),
+            const Text("4. ¡El video aparecerá automáticamente con latencia cero!", style: TextStyle(color: Colors.white)),
+            const SizedBox(height: 10),
+            const Text("Si usas cable USB, abre CMD y usa 'adb reverse tcp:8080 tcp:8080' y la URL será http://localhost:8080", style: TextStyle(color: Colors.grey, fontSize: 12)),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text("ENTENDIDO", style: TextStyle(color: Colors.blueAccent)),
+          )
+        ],
+      ),
+    );
+  }
+
   void _showSettingsPanel() {
+    // Hemos perdido Zoom y Exposición nativa por el cambio a WebRTC. 
+    // Mantenemos solo el selector de lentes y un mensaje de aviso.
     showModalBottomSheet(
       context: context,
       backgroundColor: Colors.black87,
@@ -132,10 +289,9 @@ class _CameraScreenState extends State<CameraScreen> {
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  const Text("Ajustes de Cámara", style: TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold)),
+                  const Text("Ajustes de Lente (WebRTC)", style: TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold)),
                   const SizedBox(height: 20),
                   
-                  // LENTE (SELECCIÓN DE CÁMARA MULTIPLE)
                   Row(
                     children: [
                       const Icon(Icons.camera_alt, color: Colors.white),
@@ -143,26 +299,22 @@ class _CameraScreenState extends State<CameraScreen> {
                       const Text("Lente:", style: TextStyle(color: Colors.white)),
                       const SizedBox(width: 10),
                       Expanded(
-                        child: DropdownButton<CameraDescription>(
+                        child: DropdownButton<MediaDeviceInfo>(
                           dropdownColor: Colors.black87,
                           isExpanded: true,
                           value: _selectedCamera,
                           style: const TextStyle(color: Colors.white),
-                          items: cameras.map((c) {
-                            // En Android los nombres suelen ser 0, 1, 2, 3
-                            String lensName = "Lente ${c.name} (${c.lensDirection.name})";
+                          items: _cameras.map((c) {
                             return DropdownMenuItem(
                               value: c,
-                              child: Text(lensName, overflow: TextOverflow.ellipsis),
+                              child: Text(c.label.isNotEmpty ? c.label : "Cámara ${c.deviceId}", overflow: TextOverflow.ellipsis),
                             );
                           }).toList(),
                           onChanged: (newCamera) async {
                             if (newCamera != null && newCamera != _selectedCamera) {
-                              Navigator.pop(context); // Cerramos el panel
-                              setState(() {
-                                _isReady = false; // Pantalla de carga
-                              });
-                              await _initCamera(newCamera); // Cargamos nuevo lente
+                              Navigator.pop(context);
+                              setState(() => _isReady = false);
+                              await _initCamera(newCamera);
                             }
                           },
                         ),
@@ -206,7 +358,7 @@ class _CameraScreenState extends State<CameraScreen> {
                   ),
                   const SizedBox(height: 10),
 
-                  // Velocidad (FPS) - Se aplicará en el motor WebRTC
+                  // Velocidad (FPS)
                   Row(
                     children: [
                       const Icon(Icons.speed, color: Colors.white),
@@ -225,98 +377,23 @@ class _CameraScreenState extends State<CameraScreen> {
                               child: Text("$fps FPS"),
                             );
                           }).toList(),
-                          onChanged: (newFps) {
-                            if (newFps != null) {
-                              setModalState(() {
+                          onChanged: (newFps) async {
+                            if (newFps != null && newFps != _currentFps) {
+                              Navigator.pop(context);
+                              setState(() {
                                 _currentFps = newFps;
+                                _isReady = false;
                               });
+                              await _initCamera(_selectedCamera);
                             }
                           },
                         ),
                       ),
                     ],
                   ),
-                  const SizedBox(height: 10),
-                  
-                  // Slider de Zoom
-                  Row(
-                    children: [
-                      const Icon(Icons.zoom_in, color: Colors.white),
-                      const SizedBox(width: 10),
-                      Expanded(
-                        child: Slider(
-                          value: _currentZoom,
-                          min: _minZoom,
-                          max: _maxZoom,
-                          activeColor: Colors.blueAccent,
-                          onChanged: (value) async {
-                            setModalState(() => _currentZoom = value);
-                            await _controller?.setZoomLevel(value);
-                          },
-                        ),
-                      ),
-                      SizedBox(
-                        width: 40, 
-                        child: Text("${_currentZoom.toStringAsFixed(1)}x", style: const TextStyle(color: Colors.white))
-                      ),
-                    ],
-                  ),
-                  
-                  // Slider de Exposición (Brillo)
-                  Row(
-                    children: [
-                      const Icon(Icons.brightness_6, color: Colors.white),
-                      const SizedBox(width: 10),
-                      Expanded(
-                        child: Slider(
-                          value: _currentExposure,
-                          min: _minExposure,
-                          max: _maxExposure,
-                          activeColor: Colors.amber,
-                          onChanged: (value) async {
-                            setModalState(() => _currentExposure = value);
-                            await _controller?.setExposureOffset(value);
-                          },
-                        ),
-                      ),
-                      SizedBox(
-                        width: 40,
-                        child: Text(
-                          "${_currentExposure > 0 ? '+' : ''}${_currentExposure.toStringAsFixed(1)}",
-                          style: const TextStyle(color: Colors.white)
-                        ),
-                      ),
-                    ],
-                  ),
-                  
-                  // Toggle Enfoque
-                  const SizedBox(height: 10),
-                  Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                    children: [
-                      const Row(
-                        children: [
-                          Icon(Icons.center_focus_strong, color: Colors.white),
-                          SizedBox(width: 10),
-                          Text("Bloquear Enfoque", style: TextStyle(color: Colors.white)),
-                        ],
-                      ),
-                      Switch(
-                        value: _isFocusLocked,
-                        activeColor: Colors.redAccent,
-                        onChanged: (value) async {
-                          setState(() {
-                            _isFocusLocked = value;
-                          });
-                          setModalState(() {});
-                          await _controller?.setFocusMode(
-                            value ? FocusMode.locked : FocusMode.auto,
-                          );
-                        },
-                      )
-                    ],
-                  ),
-                  
+                  const SizedBox(height: 20),
+                  const Text("NOTA: Zoom y Exposición Manual están deshabilitados en modo WebRTC para priorizar latencia cero y aceleración de hardware.", 
+                             style: TextStyle(color: Colors.amber, fontSize: 12), textAlign: TextAlign.center),
                   const SizedBox(height: 20),
                 ],
               ),
@@ -329,11 +406,9 @@ class _CameraScreenState extends State<CameraScreen> {
 
   @override
   Widget build(BuildContext context) {
-    if (!_isReady || _controller == null || !_controller!.value.isInitialized) {
+    if (!_isReady || _localStream == null) {
       return const Scaffold(
-        body: Center(
-          child: CircularProgressIndicator(color: Colors.white),
-        ),
+        body: Center(child: CircularProgressIndicator(color: Colors.white)),
       );
     }
 
@@ -341,26 +416,12 @@ class _CameraScreenState extends State<CameraScreen> {
       body: Stack(
         fit: StackFit.expand,
         children: [
-          LayoutBuilder(
-            builder: (context, constraints) {
-              final scale = 1 / (_controller!.value.aspectRatio * constraints.maxHeight / constraints.maxWidth);
-              return GestureDetector(
-                behavior: HitTestBehavior.opaque,
-                onTapDown: (details) {
-                  if (_controller == null || _isFocusLocked) return;
-                  final x = details.localPosition.dx / constraints.maxWidth;
-                  final y = details.localPosition.dy / constraints.maxHeight;
-                  _controller!.setFocusPoint(Offset(x, y));
-                },
-                child: Center(
-                  child: AspectRatio(
-                    // Flutter en vertical requiere invertir el aspect ratio
-                    aspectRatio: 1 / _controller!.value.aspectRatio,
-                    child: CameraPreview(_controller!),
-                  ),
-                ),
-              );
-            }
+          // Visor WebRTC sin distorsión (Se adapta a horizontal y vertical)
+          Positioned.fill(
+            child: RTCVideoView(
+              _localRenderer, 
+              objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitCover,
+            ),
           ),
           
           SafeArea(
@@ -372,12 +433,15 @@ class _CameraScreenState extends State<CameraScreen> {
                   child: Row(
                     mainAxisAlignment: MainAxisAlignment.spaceBetween,
                     children: [
-                      _buildStatusChip(Icons.wifi, "OBS: Desc"),
-                      _buildStatusChip(
-                        _isFocusLocked ? Icons.lock : Icons.center_focus_weak, 
-                        _isFocusLocked ? "Enfoque: FIJO" : "Enfoque: AUTO",
-                        color: _isFocusLocked ? Colors.redAccent : Colors.black54
+                      GestureDetector(
+                        onTap: _showOBSInstructions,
+                        child: _buildStatusChip(
+                          Icons.wifi, 
+                          _isObsConnected ? "OBS: CONECTADO" : "OBS: Esperando...",
+                          color: _isObsConnected ? Colors.green : Colors.black54
+                        ),
                       ),
+                      _buildStatusChip(Icons.tv, _localIp),
                     ],
                   ),
                 ),
@@ -398,9 +462,19 @@ class _CameraScreenState extends State<CameraScreen> {
                         onPressed: _showSettingsPanel,
                       ),
                       FloatingActionButton(
-                        backgroundColor: Colors.redAccent,
-                        onPressed: () {},
-                        child: const Icon(Icons.live_tv, color: Colors.white),
+                        backgroundColor: _isStreaming ? Colors.green : Colors.redAccent,
+                        onPressed: () {
+                          if (_isStreaming) {
+                            _stopWebRTCStream();
+                          } else {
+                            if (_isObsConnected) {
+                              _startWebRTCStream();
+                            } else {
+                              _showOBSInstructions();
+                            }
+                          }
+                        },
+                        child: Icon(_isStreaming ? Icons.stop : Icons.live_tv, color: Colors.white),
                       ),
                       IconButton(
                         icon: const Icon(Icons.gamepad, color: Colors.white, size: 30),

@@ -38,6 +38,10 @@ dependencies:
   permission_handler: ^13.0.0
   flutter_webrtc: ^1.6.0
   flutter_blue_plus: ^2.3.12
+  shelf: ^1.4.2
+  shelf_web_socket: ^3.0.0
+  shelf_router: ^1.1.4
+  network_info_plus: ^8.2.1
 
 dev_dependencies:
   flutter_test:
