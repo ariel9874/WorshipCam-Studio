@@ -7,9 +7,12 @@ import 'package:shelf_web_socket/shelf_web_socket.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 import 'web_client.dart';
 
+import 'dart:io';
+
 class LocalSignalingServer {
   final int port = 8080;
   final Map<String, WebSocketChannel> webrtcClients = {};
+  HttpServer? _httpServer;
   
   // Callbacks para comunicar con main.dart (WebRTC)
   Function(String clientId, Map<String, dynamic> message)? onMessageReceived;
@@ -31,7 +34,8 @@ class LocalSignalingServer {
     // 2. Ruta WebSocket: Clientes de Video (OBS y Windows App)
     router.get('/ws', webSocketHandler((webSocket, protocol) {
       // Mutex: Desconectar clientes anteriores
-      for (var client in webrtcClients.values) {
+      final oldClients = webrtcClients.values.toList();
+      for (var client in oldClients) {
         client.sink.close();
       }
       webrtcClients.clear();
@@ -67,8 +71,17 @@ class LocalSignalingServer {
     }));
 
     // Iniciar el servidor escuchando en todas las interfaces de red (0.0.0.0)
-    await io.serve(router.call, '0.0.0.0', port);
+    _httpServer = await io.serve(router.call, '0.0.0.0', port);
     debugPrint('Servidor Local corriendo en puerto $port');
+  }
+
+  Future<void> stop() async {
+    final clients = webrtcClients.values.toList();
+    for (var client in clients) {
+      client.sink.close();
+    }
+    webrtcClients.clear();
+    await _httpServer?.close(force: true);
   }
 
   void sendMessageToClient(String clientId, Map<String, dynamic> message) {
