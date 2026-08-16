@@ -21,52 +21,66 @@ const String webClientHtml = '''
             'iceServers': [{ 'urls': 'stun:stun.l.google.com:19302' }]
         };
 
-        ws.onmessage = async (event) => {
-            const message = JSON.parse(event.data);
+        function connect() {
+            const ws = new WebSocket(`ws://\${window.location.host}/ws`);
 
-            if (message.type === 'offer') {
-                peerConnection = new RTCPeerConnection(config);
-                
-                // Cuando recibimos el stream de video, lo ponemos en el elemento <video>
-                peerConnection.ontrack = (event) => {
-                    if (video.srcObject !== event.streams[0]) {
-                        video.srcObject = event.streams[0];
-                        // Forzamos el play por las políticas de autoplay de OBS/Chrome
-                        video.play().catch(e => console.error(e));
+            ws.onmessage = async (event) => {
+                const message = JSON.parse(event.data);
+
+                if (message.type === 'offer') {
+                    if (peerConnection) {
+                        peerConnection.close();
                     }
-                };
+                    peerConnection = new RTCPeerConnection(config);
+                    
+                    // Cuando recibimos el stream de video, lo ponemos en el elemento <video>
+                    peerConnection.ontrack = (event) => {
+                        if (video.srcObject !== event.streams[0]) {
+                            video.srcObject = event.streams[0];
+                            // Forzamos el play por las políticas de autoplay de OBS/Chrome
+                            video.play().catch(e => console.error(e));
+                        }
+                    };
 
-                // Enviamos candidatos ICE de vuelta al celular
-                peerConnection.onicecandidate = (event) => {
-                    if (event.candidate) {
-                        ws.send(JSON.stringify({
-                            'type': 'candidate',
-                            'candidate': event.candidate
-                        }));
+                    // Enviamos candidatos ICE de vuelta al celular
+                    peerConnection.onicecandidate = (event) => {
+                        if (event.candidate) {
+                            ws.send(JSON.stringify({
+                                'type': 'candidate',
+                                'candidate': event.candidate
+                            }));
+                        }
+                    };
+
+                    // Aceptamos la oferta
+                    await peerConnection.setRemoteDescription(new RTCSessionDescription(message.offer));
+                    const answer = await peerConnection.createAnswer();
+                    await peerConnection.setLocalDescription(answer);
+
+                    // Enviamos la respuesta
+                    ws.send(JSON.stringify({
+                        'type': 'answer',
+                        'answer': answer
+                    }));
+                } else if (message.type === 'candidate') {
+                    // Recibimos un candidato ICE del celular
+                    if (peerConnection) {
+                        await peerConnection.addIceCandidate(new RTCIceCandidate(message.candidate));
                     }
-                };
-
-                // Aceptamos la oferta
-                await peerConnection.setRemoteDescription(new RTCSessionDescription(message.offer));
-                const answer = await peerConnection.createAnswer();
-                await peerConnection.setLocalDescription(answer);
-
-                // Enviamos la respuesta
-                ws.send(JSON.stringify({
-                    'type': 'answer',
-                    'answer': answer
-                }));
-            } else if (message.type === 'candidate') {
-                // Recibimos un candidato ICE del celular
-                if (peerConnection) {
-                    await peerConnection.addIceCandidate(new RTCIceCandidate(message.candidate));
                 }
-            }
-        };
+            };
 
-        ws.onopen = () => {
-            console.log('Connected to WorshipCam Studio signaling server');
-        };
+            ws.onopen = () => {
+                console.log('Connected to WorshipCam Studio signaling server');
+            };
+
+            ws.onclose = () => {
+                console.log('Connection lost. Reconnecting in 2 seconds...');
+                setTimeout(connect, 2000);
+            };
+        }
+
+        connect();
     </script>
 </body>
 </html>

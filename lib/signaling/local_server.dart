@@ -9,12 +9,16 @@ import 'web_client.dart';
 
 class LocalSignalingServer {
   final int port = 8080;
-  WebSocketChannel? _obsChannel;
+  final Map<String, WebSocketChannel> webrtcClients = {};
   
-  // Callbacks para comunicar con main.dart
-  Function(Map<String, dynamic>)? onMessageReceived;
-  Function()? onClientConnected;
-  Function()? onClientDisconnected;
+  // Callbacks para comunicar con main.dart (WebRTC)
+  Function(String clientId, Map<String, dynamic> message)? onMessageReceived;
+  Function(String clientId)? onClientConnected;
+  Function(String clientId)? onClientDisconnected;
+
+  // Callbacks para el Control Remoto
+  Function(Map<String, dynamic> message)? onRemoteCommandReceived;
+  Function(bool connected)? onRemoteControlStatusChanged;
 
   Future<void> start() async {
     final router = Router();
@@ -24,31 +28,41 @@ class LocalSignalingServer {
       return Response.ok(webClientHtml, headers: {'Content-Type': 'text/html'});
     });
 
-    // 2. Ruta WebSocket: OBS se conecta aquí para negociar el video
+    // 2. Ruta WebSocket: Clientes de Video (OBS y Windows App)
     router.get('/ws', webSocketHandler((webSocket, protocol) {
-      _obsChannel = webSocket;
-      debugPrint("OBS conectado vía WebSocket!");
-      onClientConnected?.call();
+      // Mutex: Desconectar clientes anteriores
+      for (var client in webrtcClients.values) {
+        client.sink.close();
+      }
+      webrtcClients.clear();
+
+      final clientId = DateTime.now().millisecondsSinceEpoch.toString();
+      webrtcClients[clientId] = webSocket;
+      
+      debugPrint("Cliente WebRTC conectado: $clientId");
+      onClientConnected?.call(clientId);
 
       webSocket.stream.listen((message) {
         final data = jsonDecode(message);
-        onMessageReceived?.call(data);
+        onMessageReceived?.call(clientId, data);
       }, onDone: () {
-        debugPrint("OBS desconectado");
-        _obsChannel = null;
-        onClientDisconnected?.call();
+        debugPrint("Cliente WebRTC desconectado: $clientId");
+        webrtcClients.remove(clientId);
+        onClientDisconnected?.call(clientId);
       });
     }));
 
     // 3. Ruta WebSocket para el Control Remoto (App de Windows)
     router.get('/control', webSocketHandler((webSocket, protocol) {
-      debugPrint("Control Remoto de Windows conectado!");
+      debugPrint("Control Remoto conectado!");
+      onRemoteControlStatusChanged?.call(true);
       
       webSocket.stream.listen((message) {
         final data = jsonDecode(message);
-        onMessageReceived?.call(data);
+        onRemoteCommandReceived?.call(data);
       }, onDone: () {
         debugPrint("Control Remoto desconectado");
+        onRemoteControlStatusChanged?.call(false);
       });
     }));
 
@@ -57,11 +71,16 @@ class LocalSignalingServer {
     debugPrint('Servidor Local corriendo en puerto $port');
   }
 
-  void sendMessage(Map<String, dynamic> message) {
-    if (_obsChannel != null) {
-      _obsChannel!.sink.add(jsonEncode(message));
-    } else {
-      debugPrint("Error: Intentando enviar mensaje WebRTC pero OBS no está conectado.");
+  void sendMessageToClient(String clientId, Map<String, dynamic> message) {
+    if (webrtcClients.containsKey(clientId)) {
+      webrtcClients[clientId]!.sink.add(jsonEncode(message));
+    }
+  }
+
+  void sendMessageToAll(Map<String, dynamic> message) {
+    final msg = jsonEncode(message);
+    for (var client in webrtcClients.values) {
+      client.sink.add(msg);
     }
   }
 }

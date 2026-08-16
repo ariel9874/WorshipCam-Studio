@@ -2,8 +2,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:network_info_plus/network_info_plus.dart';
-import 'package:flutter/foundation.dart';
-import 'signaling/local_server_stub.dart' if (dart.library.io) 'signaling/local_server.dart';
+import 'dart:io' show Platform;
+import 'signaling/local_server.dart';
 import 'remote_control_screen.dart';
 
 Future<void> main() async {
@@ -22,7 +22,7 @@ class CamoCloneApp extends StatelessWidget {
         primaryColor: Colors.blueAccent,
         scaffoldBackgroundColor: Colors.black,
       ),
-      home: (kIsWeb || (!kIsWeb && (defaultTargetPlatform == TargetPlatform.windows || defaultTargetPlatform == TargetPlatform.macOS || defaultTargetPlatform == TargetPlatform.linux))) 
+      home: (Platform.isWindows || Platform.isMacOS || Platform.isLinux) 
           ? const RemoteControlScreen() 
           : const CameraScreen(),
       debugShowCheckedModeBanner: false,
@@ -49,7 +49,8 @@ class _CameraScreenState extends State<CameraScreen> {
   LocalSignalingServer? _signalingServer;
   String _localIp = "Obteniendo IP...";
   bool _isStreaming = false;
-  bool _isObsConnected = false;
+  int _connectedClientsCount = 0;
+  bool _isRemoteControlConnected = false;
   
   // UI State
   bool _isReady = false;
@@ -92,10 +93,11 @@ class _CameraScreenState extends State<CameraScreen> {
     }
   }
 
+  String? _errorMessage;
+
   Future<void> _initCamera([MediaDeviceInfo? camera]) async {
     _selectedCamera = camera ?? (_cameras.isNotEmpty ? _cameras.first : null);
     
-    // Si ya había un stream, detenerlo para cambiar de cámara
     if (_localStream != null) {
       _localStream!.getTracks().forEach((track) => track.stop());
     }
@@ -130,10 +132,9 @@ class _CameraScreenState extends State<CameraScreen> {
       _localStream = await navigator.mediaDevices.getUserMedia(mediaConstraints);
       _localRenderer.srcObject = _localStream;
       
-      // Actualizar el stream en OBS si ya estábamos transmitiendo
-      if (_peerConnection != null && _isStreaming) {
-        final senders = await _peerConnection!.getSenders();
+      if (_isStreaming && _peerConnection != null) {
         final videoTrack = _localStream!.getVideoTracks().first;
+        final senders = await _peerConnection!.getSenders();
         for (var sender in senders) {
           if (sender.track?.kind == 'video') {
             await sender.replaceTrack(videoTrack);
@@ -144,40 +145,43 @@ class _CameraScreenState extends State<CameraScreen> {
       if (mounted) {
         setState(() {
           _isReady = true;
+          _errorMessage = null;
         });
       }
     } catch (e) {
       debugPrint("Error iniciando cámara WebRTC: $e");
+      if (mounted) {
+        setState(() {
+          _errorMessage = "Fallo al iniciar cámara: $e";
+          _isReady = true; // Desbloquear UI
+        });
+      }
     }
   }
 
   Future<void> _initSignalingServer() async {
     _signalingServer = LocalSignalingServer();
     
-    _signalingServer!.onClientConnected = () {
-      setState(() => _isObsConnected = true);
+    _signalingServer!.onClientConnected = (clientId) {
+      setState(() => _connectedClientsCount = 1);
+      if (_isStreaming) {
+        _startWebRTCStream();
+      }
     };
     
-    _signalingServer!.onClientDisconnected = () {
-      setState(() => _isObsConnected = false);
+    _signalingServer!.onClientDisconnected = (clientId) {
+      setState(() => _connectedClientsCount = 0);
       _peerConnection?.close();
       _peerConnection = null;
     };
+    
+    _signalingServer!.onRemoteControlStatusChanged = (connected) {
+      setState(() => _isRemoteControlConnected = connected);
+    };
 
-    _signalingServer!.onMessageReceived = (message) async {
+    _signalingServer!.onRemoteCommandReceived = (message) async {
       final type = message['type'];
-      
-      if (type == 'answer') {
-        final answer = RTCSessionDescription(message['answer']['sdp'], message['answer']['type']);
-        await _peerConnection?.setRemoteDescription(answer);
-      } else if (type == 'candidate') {
-        final candidate = RTCIceCandidate(
-          message['candidate']['candidate'],
-          message['candidate']['sdpMid'],
-          message['candidate']['sdpMLineIndex'],
-        );
-        await _peerConnection?.addCandidate(candidate);
-      } else if (type == 'switch_lens') {
+      if (type == 'switch_lens') {
         if (_cameras.isNotEmpty && _selectedCamera != null) {
           int currentIndex = _cameras.indexOf(_selectedCamera!);
           int nextIndex = (currentIndex + 1) % _cameras.length;
@@ -212,6 +216,22 @@ class _CameraScreenState extends State<CameraScreen> {
       }
     };
 
+    _signalingServer!.onMessageReceived = (clientId, message) async {
+      final type = message['type'];
+      
+      if (type == 'answer') {
+        final answer = RTCSessionDescription(message['answer']['sdp'], message['answer']['type']);
+        await _peerConnection?.setRemoteDescription(answer);
+      } else if (type == 'candidate') {
+        final candidate = RTCIceCandidate(
+          message['candidate']['candidate'],
+          message['candidate']['sdpMid'],
+          message['candidate']['sdpMLineIndex'],
+        );
+        await _peerConnection?.addCandidate(candidate);
+      }
+    };
+
     await _signalingServer!.start();
   }
 
@@ -224,10 +244,15 @@ class _CameraScreenState extends State<CameraScreen> {
       ]
     };
 
+    // Cerrar la conexión anterior si existe
+    if (_peerConnection != null) {
+      await _peerConnection!.close();
+    }
+
     _peerConnection = await createPeerConnection(configuration);
 
     _peerConnection!.onIceCandidate = (candidate) {
-      _signalingServer!.sendMessage({
+      _signalingServer!.sendMessageToAll({
         'type': 'candidate',
         'candidate': {
           'candidate': candidate.candidate,
@@ -244,7 +269,7 @@ class _CameraScreenState extends State<CameraScreen> {
     final offer = await _peerConnection!.createOffer();
     await _peerConnection!.setLocalDescription(offer);
 
-    _signalingServer!.sendMessage({
+    _signalingServer!.sendMessageToAll({
       'type': 'offer',
       'offer': {
         'type': offer.type,
@@ -442,9 +467,37 @@ class _CameraScreenState extends State<CameraScreen> {
 
   @override
   Widget build(BuildContext context) {
-    if (!_isReady || _localStream == null) {
+    if (!_isReady) {
       return const Scaffold(
         body: Center(child: CircularProgressIndicator(color: Colors.white)),
+      );
+    }
+
+    if (_errorMessage != null || _localStream == null) {
+      return Scaffold(
+        body: Center(
+          child: Padding(
+            padding: const EdgeInsets.all(20.0),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Icon(Icons.error_outline, color: Colors.redAccent, size: 60),
+                const SizedBox(height: 20),
+                Text(_errorMessage ?? "Error desconocido al acceder a la cámara.", 
+                     textAlign: TextAlign.center, 
+                     style: const TextStyle(color: Colors.white, fontSize: 16)),
+                const SizedBox(height: 30),
+                ElevatedButton(
+                  onPressed: () {
+                    setState(() { _isReady = false; });
+                    _initCamera();
+                  },
+                  child: const Text("Reintentar"),
+                )
+              ],
+            ),
+          ),
+        ),
       );
     }
 
@@ -466,18 +519,38 @@ class _CameraScreenState extends State<CameraScreen> {
               children: [
                 Padding(
                   padding: const EdgeInsets.all(16.0),
-                  child: Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  child: Column(
                     children: [
-                      GestureDetector(
-                        onTap: _showOBSInstructions,
-                        child: _buildStatusChip(
-                          Icons.wifi, 
-                          _isObsConnected ? "OBS: CONECTADO" : "OBS: Esperando...",
-                          color: _isObsConnected ? Colors.green : Colors.black54
-                        ),
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: [
+                          GestureDetector(
+                            onTap: _showOBSInstructions,
+                            child: _buildStatusChip(
+                              Icons.visibility, 
+                              _connectedClientsCount > 0 ? "ESPECTADORES: $_connectedClientsCount" : "ESPECTADORES: 0",
+                              color: _connectedClientsCount > 0 ? Colors.green : Colors.black54
+                            ),
+                          ),
+                          _buildStatusChip(Icons.tv, _localIp),
+                        ],
                       ),
-                      _buildStatusChip(Icons.tv, _localIp),
+                      const SizedBox(height: 10),
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: [
+                          _buildStatusChip(
+                            Icons.gamepad, 
+                            _isRemoteControlConnected ? "CONTROL REMOTO: ON" : "CONTROL REMOTO: OFF",
+                            color: _isRemoteControlConnected ? Colors.purpleAccent : Colors.black54
+                          ),
+                          _buildStatusChip(
+                            Icons.high_quality, 
+                            "${_currentResolution.name.toUpperCase()} @ ${_currentFps}fps",
+                            color: Colors.blueAccent
+                          ),
+                        ],
+                      ),
                     ],
                   ),
                 ),
@@ -503,11 +576,7 @@ class _CameraScreenState extends State<CameraScreen> {
                           if (_isStreaming) {
                             _stopWebRTCStream();
                           } else {
-                            if (_isObsConnected) {
-                              _startWebRTCStream();
-                            } else {
-                              _showOBSInstructions();
-                            }
+                            _startWebRTCStream();
                           }
                         },
                         child: Icon(_isStreaming ? Icons.stop : Icons.live_tv, color: Colors.white),

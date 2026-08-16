@@ -1,5 +1,7 @@
 import 'dart:convert';
+import 'dart:io';
 import 'package:flutter/material.dart';
+import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
 class RemoteControlScreen extends StatefulWidget {
@@ -10,9 +12,54 @@ class RemoteControlScreen extends StatefulWidget {
 }
 
 class _RemoteControlScreenState extends State<RemoteControlScreen> {
-  final TextEditingController _ipController = TextEditingController(text: '192.168.1.239');
-  WebSocketChannel? _channel;
+  final TextEditingController _ipController = TextEditingController(text: '127.0.0.1');
+  WebSocketChannel? _channel; // Canal para JSON commands
   bool _isConnected = false;
+  bool _isTunnelActive = false;
+
+  // WebRTC Monitor
+  final RTCVideoRenderer _remoteRenderer = RTCVideoRenderer();
+  RTCPeerConnection? _peerConnection;
+  WebSocketChannel? _webrtcChannel; // Canal para Signaling de WebRTC
+  bool _isMonitoring = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _remoteRenderer.initialize();
+    _setupUSBTunnel();
+  }
+
+  Future<void> _setupUSBTunnel() async {
+    try {
+      if (Platform.isWindows || Platform.isMacOS || Platform.isLinux) {
+        debugPrint("Iniciando túnel USB ADB...");
+        
+        String adbCommand = 'adb';
+        if (Platform.isWindows) {
+          final localAppData = Platform.environment['LOCALAPPDATA'];
+          if (localAppData != null) {
+            final adbPath = '$localAppData\\Android\\Sdk\\platform-tools\\adb.exe';
+            if (File(adbPath).existsSync()) {
+              adbCommand = adbPath;
+            }
+          }
+        }
+        
+        final result = await Process.run(adbCommand, ['forward', 'tcp:8080', 'tcp:8080']);
+        if (result.exitCode == 0) {
+          debugPrint("Túnel USB establecido.");
+          setState(() {
+            _isTunnelActive = true;
+          });
+        } else {
+          debugPrint("Fallo al establecer túnel ADB: ${result.stderr}");
+        }
+      }
+    } catch (e) {
+      debugPrint("Error ejecutando adb: $e");
+    }
+  }
 
   void _connect() {
     if (_ipController.text.isEmpty) return;
@@ -42,6 +89,9 @@ class _RemoteControlScreenState extends State<RemoteControlScreen> {
           setState(() {
             _isConnected = false;
           });
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Error de conexión: $error'), backgroundColor: Colors.red));
+          }
         },
       );
     } catch (e) {
@@ -49,6 +99,9 @@ class _RemoteControlScreenState extends State<RemoteControlScreen> {
       setState(() {
         _isConnected = false;
       });
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('No se pudo conectar: $e'), backgroundColor: Colors.red));
+      }
     }
   }
 
@@ -67,10 +120,102 @@ class _RemoteControlScreenState extends State<RemoteControlScreen> {
     }
   }
 
+  Future<void> _startVideoMonitor() async {
+    final url = 'ws://${_ipController.text}:8080/ws';
+    _webrtcChannel = WebSocketChannel.connect(Uri.parse(url));
+    
+    final configuration = {
+      'iceServers': [
+        {'urls': 'stun:stun.l.google.com:19302'}
+      ]
+    };
+    
+    _peerConnection = await createPeerConnection(configuration);
+    
+    _peerConnection!.onIceCandidate = (candidate) {
+      _webrtcChannel!.sink.add(jsonEncode({
+        'type': 'candidate',
+        'candidate': {
+          'candidate': candidate.candidate,
+          'sdpMid': candidate.sdpMid,
+          'sdpMLineIndex': candidate.sdpMLineIndex
+        }
+      }));
+    };
+    
+    _peerConnection!.onTrack = (event) {
+      if (event.track.kind == 'video') {
+        _remoteRenderer.srcObject = event.streams[0];
+        setState(() {});
+      }
+    };
+    
+    _webrtcChannel!.stream.listen((message) async {
+      final data = jsonDecode(message);
+      final type = data['type'];
+      
+      if (type == 'offer') {
+        final offer = RTCSessionDescription(data['offer']['sdp'], data['offer']['type']);
+        await _peerConnection!.setRemoteDescription(offer);
+        final answer = await _peerConnection!.createAnswer();
+        await _peerConnection!.setLocalDescription(answer);
+        
+        _webrtcChannel!.sink.add(jsonEncode({
+          'type': 'answer',
+          'answer': {
+            'type': answer.type,
+            'sdp': answer.sdp
+          }
+        }));
+      } else if (type == 'candidate') {
+        final candidate = RTCIceCandidate(
+          data['candidate']['candidate'],
+          data['candidate']['sdpMid'],
+          data['candidate']['sdpMLineIndex'],
+        );
+        await _peerConnection!.addCandidate(candidate);
+      }
+    }, onDone: () {
+      _stopVideoMonitor();
+    });
+    
+    setState(() {
+      _isMonitoring = true;
+    });
+  }
+
+  void _stopVideoMonitor() {
+    _webrtcChannel?.sink.close();
+    _peerConnection?.close();
+    _remoteRenderer.srcObject = null;
+    setState(() {
+      _isMonitoring = false;
+    });
+  }
+
   @override
   void dispose() {
     _channel?.sink.close();
+    _webrtcChannel?.sink.close();
+    _peerConnection?.close();
+    _remoteRenderer.dispose();
     _ipController.dispose();
+    
+    // Clean up ADB tunnel
+    if (_isTunnelActive && (Platform.isWindows || Platform.isMacOS || Platform.isLinux)) {
+      String adbCommand = 'adb';
+      if (Platform.isWindows) {
+        final localAppData = Platform.environment['LOCALAPPDATA'];
+        if (localAppData != null) {
+          final adbPath = '$localAppData\\Android\\Sdk\\platform-tools\\adb.exe';
+          if (File(adbPath).existsSync()) {
+            adbCommand = adbPath;
+          }
+        }
+      }
+      Process.run(adbCommand, ['forward', '--remove', 'tcp:8080']);
+    }
+    
     super.dispose();
   }
 
@@ -98,14 +243,55 @@ class _RemoteControlScreenState extends State<RemoteControlScreen> {
           )
         ],
       ),
-      body: Center(
-        child: Container(
-          width: 500,
-          padding: const EdgeInsets.all(20),
-          child: Column(
-            mainAxisAlignment: MainAxisAlignment.center,
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
+      body: Row(
+        children: [
+          // Área de Video
+          Expanded(
+            flex: 2,
+            child: Container(
+              color: Colors.black,
+              child: _isMonitoring 
+                  ? RTCVideoView(
+                      _remoteRenderer, 
+                      objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitContain,
+                    )
+                  : Center(
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          const Icon(Icons.videocam_off, color: Colors.white24, size: 80),
+                          const SizedBox(height: 10),
+                          const Text("Monitor de Video Apagado", style: TextStyle(color: Colors.white54)),
+                          const SizedBox(height: 20),
+                          const Padding(
+                            padding: EdgeInsets.symmetric(horizontal: 20),
+                            child: Text(
+                              "ADVERTENCIA: Activar el monitor en PC desconectará a OBS debido a límites de hardware del celular. Úsalo solo para calibración.",
+                              textAlign: TextAlign.center,
+                              style: TextStyle(color: Colors.orangeAccent, fontSize: 12),
+                            ),
+                          ),
+                          const SizedBox(height: 20),
+                          ElevatedButton.icon(
+                            onPressed: _isConnected ? _startVideoMonitor : null,
+                            icon: const Icon(Icons.play_arrow),
+                            label: const Text('Iniciar Monitor (Desconecta OBS)'),
+                            style: ElevatedButton.styleFrom(backgroundColor: Colors.green),
+                          )
+                        ],
+                      ),
+                    ),
+            ),
+          ),
+          // Área de Controles
+          Container(
+            width: 400,
+            padding: const EdgeInsets.all(20),
+            color: const Color(0xFF1E1E2E),
+            child: SingleChildScrollView(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
               // Connection Section
               Card(
                 color: const Color(0xFF282A36),
@@ -114,6 +300,19 @@ class _RemoteControlScreenState extends State<RemoteControlScreen> {
                   child: Column(
                     children: [
                       const Text("Conexión a Celular", style: TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold)),
+                      if (_isTunnelActive)
+                        Container(
+                          margin: const EdgeInsets.only(top: 10, bottom: 10),
+                          padding: const EdgeInsets.all(8),
+                          decoration: BoxDecoration(color: Colors.green.withOpacity(0.2), borderRadius: BorderRadius.circular(8)),
+                          child: const Row(
+                            children: [
+                              Icon(Icons.usb, color: Colors.greenAccent),
+                              SizedBox(width: 10),
+                              Expanded(child: Text("Túnel USB activo. Conexión garantizada por cable.", style: TextStyle(color: Colors.greenAccent, fontSize: 12))),
+                            ],
+                          ),
+                        ),
                       const SizedBox(height: 10),
                       TextField(
                         controller: _ipController,
@@ -209,9 +408,20 @@ class _RemoteControlScreenState extends State<RemoteControlScreen> {
                   ),
                 ),
               ),
+              if (_isMonitoring) ...[
+                const SizedBox(height: 20),
+                ElevatedButton.icon(
+                  onPressed: _stopVideoMonitor,
+                  icon: const Icon(Icons.stop),
+                  label: const Text('Detener Monitor'),
+                  style: ElevatedButton.styleFrom(backgroundColor: Colors.redAccent),
+                )
+              ]
             ],
           ),
         ),
+      ),
+        ],
       ),
     );
   }
