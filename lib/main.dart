@@ -107,6 +107,8 @@ class _CameraScreenState extends State<CameraScreen> {
       final type = message['type'];
       if (type == 'switch_lens') {
         _cameraService.switchLens();
+      } else if (type == 'toggle_flash') {
+        _cameraService.toggleFlash();
       } else if (type == 'set_resolution') {
         final val = message['value'];
         ResolutionPreset preset = ResolutionPreset.veryHigh;

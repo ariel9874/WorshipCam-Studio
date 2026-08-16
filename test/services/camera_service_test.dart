@@ -8,6 +8,7 @@ void main() {
     final service = CameraService();
 
     expect(service.isReady, false);
+    expect(service.isFlashOn, false);
     expect(service.currentFps, 30);
     expect(service.currentResolution, ResolutionPreset.veryHigh);
     expect(service.cameras, isEmpty);

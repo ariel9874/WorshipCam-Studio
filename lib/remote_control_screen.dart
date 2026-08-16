@@ -413,6 +413,18 @@ class _RemoteControlScreenState extends State<RemoteControlScreen> {
                             minimumSize: const Size.fromHeight(50),
                           ),
                         ),
+                        const SizedBox(height: 10),
+                        // Toggle Flash Button
+                        ElevatedButton.icon(
+                          onPressed: _isConnected ? () => _sendCommand('toggle_flash', null) : null,
+                          icon: const Icon(Icons.highlight),
+                          label: const Text('Alternar Linterna (Flash)'),
+                          style: ElevatedButton.styleFrom(
+                            backgroundColor: Colors.amber,
+                            foregroundColor: Colors.black,
+                            minimumSize: const Size.fromHeight(50),
+                          ),
+                        ),
                         const SizedBox(height: 20),
 
                         // Resolution Selector

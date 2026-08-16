@@ -116,6 +116,25 @@ class CameraService extends ChangeNotifier {
     }
   }
 
+  bool isFlashOn = false;
+
+  Future<void> toggleFlash() async {
+    if (localStream != null) {
+      final videoTracks = localStream!.getVideoTracks();
+      if (videoTracks.isNotEmpty) {
+        final track = videoTracks.first;
+        final hasTorch = await track.hasTorch();
+        if (hasTorch) {
+          isFlashOn = !isFlashOn;
+          await track.setTorch(isFlashOn);
+          notifyListeners();
+        } else {
+          debugPrint("Este lente no soporta Flash/Torch.");
+        }
+      }
+    }
+  }
+
   @override
   void dispose() {
     localRenderer.dispose();
