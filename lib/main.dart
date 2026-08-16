@@ -5,6 +5,7 @@ import 'package:network_info_plus/network_info_plus.dart';
 import 'dart:io' show Platform;
 import 'signaling/local_server.dart';
 import 'remote_control_screen.dart';
+import 'services/camera_service.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -37,12 +38,9 @@ class CameraScreen extends StatefulWidget {
   State<CameraScreen> createState() => _CameraScreenState();
 }
 
-enum ResolutionPreset { low, medium, high, veryHigh, ultraHigh, max }
-
 class _CameraScreenState extends State<CameraScreen> {
   // WebRTC
-  final RTCVideoRenderer _localRenderer = RTCVideoRenderer();
-  MediaStream? _localStream;
+  final CameraService _cameraService = CameraService();
   RTCPeerConnection? _peerConnection;
   
   // Servidor Local
@@ -52,13 +50,6 @@ class _CameraScreenState extends State<CameraScreen> {
   int _connectedClientsCount = 0;
   bool _isRemoteControlConnected = false;
   
-  // UI State
-  bool _isReady = false;
-  List<MediaDeviceInfo> _cameras = [];
-  MediaDeviceInfo? _selectedCamera;
-  ResolutionPreset _currentResolution = ResolutionPreset.veryHigh;
-  int _currentFps = 30;
-
   @override
   void initState() {
     super.initState();
@@ -74,12 +65,10 @@ class _CameraScreenState extends State<CameraScreen> {
     ].request();
 
     try {
-      await _localRenderer.initialize();
-      // En WebRTC, pedimos la lista de dispositivos
-      final devices = await navigator.mediaDevices.enumerateDevices();
-      _cameras = devices.where((d) => d.kind == 'videoinput').toList();
-      
-      await _initCamera();
+      _cameraService.addListener(() {
+        if (mounted) setState(() {});
+      });
+      await _cameraService.initialize();
       await _initSignalingServer();
       
       // Obtener IP local para mostrar al usuario
@@ -90,72 +79,6 @@ class _CameraScreenState extends State<CameraScreen> {
       
     } catch (e) {
       debugPrint('Error inicializando: $e');
-    }
-  }
-
-  String? _errorMessage;
-
-  Future<void> _initCamera([MediaDeviceInfo? camera]) async {
-    _selectedCamera = camera ?? (_cameras.isNotEmpty ? _cameras.first : null);
-    
-    if (_localStream != null) {
-      _localStream!.getTracks().forEach((track) => track.stop());
-    }
-
-    String minWidth = '1280';
-    String minHeight = '720';
-    if (_currentResolution == ResolutionPreset.max || _currentResolution == ResolutionPreset.ultraHigh || _currentResolution == ResolutionPreset.veryHigh) {
-      minWidth = '1920';
-      minHeight = '1080';
-    } else if (_currentResolution == ResolutionPreset.high) {
-      minWidth = '1280';
-      minHeight = '720';
-    } else {
-      minWidth = '640';
-      minHeight = '480';
-    }
-
-    final Map<String, dynamic> mediaConstraints = {
-      'audio': false,
-      'video': {
-        'mandatory': {
-          'minWidth': minWidth,
-          'minHeight': minHeight,
-          'minFrameRate': _currentFps.toString(),
-        },
-        'facingMode': 'environment',
-        'optional': _selectedCamera != null ? [{'sourceId': _selectedCamera!.deviceId}] : [],
-      }
-    };
-
-    try {
-      _localStream = await navigator.mediaDevices.getUserMedia(mediaConstraints);
-      _localRenderer.srcObject = _localStream;
-      
-      if (_isStreaming && _peerConnection != null) {
-        final videoTrack = _localStream!.getVideoTracks().first;
-        final senders = await _peerConnection!.getSenders();
-        for (var sender in senders) {
-          if (sender.track?.kind == 'video') {
-            await sender.replaceTrack(videoTrack);
-          }
-        }
-      }
-
-      if (mounted) {
-        setState(() {
-          _isReady = true;
-          _errorMessage = null;
-        });
-      }
-    } catch (e) {
-      debugPrint("Error iniciando cámara WebRTC: $e");
-      if (mounted) {
-        setState(() {
-          _errorMessage = "Fallo al iniciar cámara: $e";
-          _isReady = true; // Desbloquear UI
-        });
-      }
     }
   }
 
@@ -173,6 +96,7 @@ class _CameraScreenState extends State<CameraScreen> {
       setState(() => _connectedClientsCount = 0);
       _peerConnection?.close();
       _peerConnection = null;
+      _cameraService.peerConnection = null;
     };
     
     _signalingServer!.onRemoteControlStatusChanged = (connected) {
@@ -182,37 +106,17 @@ class _CameraScreenState extends State<CameraScreen> {
     _signalingServer!.onRemoteCommandReceived = (message) async {
       final type = message['type'];
       if (type == 'switch_lens') {
-        if (_cameras.isNotEmpty && _selectedCamera != null) {
-          int currentIndex = _cameras.indexOf(_selectedCamera!);
-          int nextIndex = (currentIndex + 1) % _cameras.length;
-          setState(() {
-            _selectedCamera = _cameras[nextIndex];
-            _isReady = false;
-          });
-          await _initCamera(_selectedCamera);
-        }
+        _cameraService.switchLens();
       } else if (type == 'set_resolution') {
         final val = message['value'];
         ResolutionPreset preset = ResolutionPreset.veryHigh;
         if (val == 'high') preset = ResolutionPreset.high;
         if (val == 'max') preset = ResolutionPreset.max;
         
-        if (preset != _currentResolution) {
-          setState(() {
-            _currentResolution = preset;
-            _isReady = false;
-          });
-          await _initCamera(_selectedCamera);
-        }
+        _cameraService.setResolution(preset);
       } else if (type == 'set_fps') {
         final fps = (message['value'] is int) ? message['value'] : int.tryParse(message['value'].toString()) ?? 30;
-        if (fps != _currentFps) {
-          setState(() {
-            _currentFps = fps;
-            _isReady = false;
-          });
-          await _initCamera(_selectedCamera);
-        }
+        _cameraService.setFps(fps);
       }
     };
 
@@ -236,7 +140,7 @@ class _CameraScreenState extends State<CameraScreen> {
   }
 
   Future<void> _startWebRTCStream() async {
-    if (_localStream == null) return;
+    if (_cameraService.localStream == null) return;
 
     final configuration = {
       'iceServers': [
@@ -250,6 +154,7 @@ class _CameraScreenState extends State<CameraScreen> {
     }
 
     _peerConnection = await createPeerConnection(configuration);
+    _cameraService.peerConnection = _peerConnection;
 
     _peerConnection!.onIceCandidate = (candidate) {
       _signalingServer!.sendMessageToAll({
@@ -262,8 +167,8 @@ class _CameraScreenState extends State<CameraScreen> {
       });
     };
 
-    _localStream!.getTracks().forEach((track) {
-      _peerConnection!.addTrack(track, _localStream!);
+    _cameraService.localStream!.getTracks().forEach((track) {
+      _peerConnection!.addTrack(track, _cameraService.localStream!);
     });
 
     final offer = await _peerConnection!.createOffer();
@@ -285,6 +190,7 @@ class _CameraScreenState extends State<CameraScreen> {
   void _stopWebRTCStream() {
     _peerConnection?.close();
     _peerConnection = null;
+    _cameraService.peerConnection = null;
     setState(() {
       _isStreaming = false;
     });
@@ -292,8 +198,7 @@ class _CameraScreenState extends State<CameraScreen> {
 
   @override
   void dispose() {
-    _localRenderer.dispose();
-    _localStream?.getTracks().forEach((track) => track.stop());
+    _cameraService.dispose();
     _peerConnection?.close();
     super.dispose();
   }
@@ -336,8 +241,6 @@ class _CameraScreenState extends State<CameraScreen> {
   }
 
   void _showSettingsPanel() {
-    // Hemos perdido Zoom y Exposición nativa por el cambio a WebRTC. 
-    // Mantenemos solo el selector de lentes y un mensaje de aviso.
     showModalBottomSheet(
       context: context,
       backgroundColor: Colors.black87,
@@ -363,19 +266,18 @@ class _CameraScreenState extends State<CameraScreen> {
                         child: DropdownButton<MediaDeviceInfo>(
                           dropdownColor: Colors.black87,
                           isExpanded: true,
-                          value: _selectedCamera,
+                          value: _cameraService.selectedCamera,
                           style: const TextStyle(color: Colors.white),
-                          items: _cameras.map((c) {
+                          items: _cameraService.cameras.map((c) {
                             return DropdownMenuItem(
                               value: c,
                               child: Text(c.label.isNotEmpty ? c.label : "Cámara ${c.deviceId}", overflow: TextOverflow.ellipsis),
                             );
                           }).toList(),
-                          onChanged: (newCamera) async {
-                            if (newCamera != null && newCamera != _selectedCamera) {
+                          onChanged: (newCamera) {
+                            if (newCamera != null && newCamera != _cameraService.selectedCamera) {
                               Navigator.pop(context);
-                              setState(() => _isReady = false);
-                              await _initCamera(newCamera);
+                              _cameraService.startCamera(newCamera);
                             }
                           },
                         ),
@@ -395,7 +297,7 @@ class _CameraScreenState extends State<CameraScreen> {
                         child: DropdownButton<ResolutionPreset>(
                           dropdownColor: Colors.black87,
                           isExpanded: true,
-                          value: _currentResolution,
+                          value: _cameraService.currentResolution,
                           style: const TextStyle(color: Colors.white),
                           items: ResolutionPreset.values.map((preset) {
                             return DropdownMenuItem(
@@ -403,14 +305,10 @@ class _CameraScreenState extends State<CameraScreen> {
                               child: Text(preset.name.toUpperCase()),
                             );
                           }).toList(),
-                          onChanged: (newPreset) async {
-                            if (newPreset != null && newPreset != _currentResolution) {
+                          onChanged: (newPreset) {
+                            if (newPreset != null && newPreset != _cameraService.currentResolution) {
                               Navigator.pop(context);
-                              setState(() {
-                                _currentResolution = newPreset;
-                                _isReady = false;
-                              });
-                              await _initCamera(_selectedCamera);
+                              _cameraService.setResolution(newPreset);
                             }
                           },
                         ),
@@ -430,7 +328,7 @@ class _CameraScreenState extends State<CameraScreen> {
                         child: DropdownButton<int>(
                           dropdownColor: Colors.black87,
                           isExpanded: true,
-                          value: _currentFps,
+                          value: _cameraService.currentFps,
                           style: const TextStyle(color: Colors.white),
                           items: [24, 30, 60].map((fps) {
                             return DropdownMenuItem(
@@ -438,14 +336,10 @@ class _CameraScreenState extends State<CameraScreen> {
                               child: Text("$fps FPS"),
                             );
                           }).toList(),
-                          onChanged: (newFps) async {
-                            if (newFps != null && newFps != _currentFps) {
+                          onChanged: (newFps) {
+                            if (newFps != null && newFps != _cameraService.currentFps) {
                               Navigator.pop(context);
-                              setState(() {
-                                _currentFps = newFps;
-                                _isReady = false;
-                              });
-                              await _initCamera(_selectedCamera);
+                              _cameraService.setFps(newFps);
                             }
                           },
                         ),
@@ -467,13 +361,13 @@ class _CameraScreenState extends State<CameraScreen> {
 
   @override
   Widget build(BuildContext context) {
-    if (!_isReady) {
+    if (!_cameraService.isReady) {
       return const Scaffold(
         body: Center(child: CircularProgressIndicator(color: Colors.white)),
       );
     }
 
-    if (_errorMessage != null || _localStream == null) {
+    if (_cameraService.errorMessage != null || _cameraService.localStream == null) {
       return Scaffold(
         body: Center(
           child: Padding(
@@ -483,14 +377,13 @@ class _CameraScreenState extends State<CameraScreen> {
               children: [
                 const Icon(Icons.error_outline, color: Colors.redAccent, size: 60),
                 const SizedBox(height: 20),
-                Text(_errorMessage ?? "Error desconocido al acceder a la cámara.", 
+                Text(_cameraService.errorMessage ?? "Error desconocido al acceder a la cámara.", 
                      textAlign: TextAlign.center, 
                      style: const TextStyle(color: Colors.white, fontSize: 16)),
                 const SizedBox(height: 30),
                 ElevatedButton(
                   onPressed: () {
-                    setState(() { _isReady = false; });
-                    _initCamera();
+                    _cameraService.startCamera();
                   },
                   child: const Text("Reintentar"),
                 )
@@ -505,10 +398,9 @@ class _CameraScreenState extends State<CameraScreen> {
       body: Stack(
         fit: StackFit.expand,
         children: [
-          // Visor WebRTC sin distorsión (Se adapta a horizontal y vertical)
           Positioned.fill(
             child: RTCVideoView(
-              _localRenderer, 
+              _cameraService.localRenderer, 
               objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitCover,
             ),
           ),
@@ -546,7 +438,7 @@ class _CameraScreenState extends State<CameraScreen> {
                           ),
                           _buildStatusChip(
                             Icons.high_quality, 
-                            "${_currentResolution.name.toUpperCase()} @ ${_currentFps}fps",
+                            "${_cameraService.currentResolution.name.toUpperCase()} @ ${_cameraService.currentFps}fps",
                             color: Colors.blueAccent
                           ),
                         ],
