@@ -6,6 +6,22 @@ import 'dart:io' show Platform;
 import 'signaling/local_server.dart';
 import 'remote_control_screen.dart';
 import 'services/camera_service.dart';
+import 'package:flutter_foreground_task/flutter_foreground_task.dart';
+import 'dart:isolate';
+
+@pragma('vm:entry-point')
+void startCallback() {
+  FlutterForegroundTask.setTaskHandler(MyTaskHandler());
+}
+
+class MyTaskHandler extends TaskHandler {
+  @override
+  Future<void> onStart(DateTime timestamp, SendPort? sendPort) async {}
+  @override
+  Future<void> onEvent(DateTime timestamp, SendPort? sendPort) async {}
+  @override
+  Future<void> onDestroy(DateTime timestamp, SendPort? sendPort) async {}
+}
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -77,8 +93,41 @@ class _CameraScreenState extends State<CameraScreen> {
         _localIp = ip ?? "127.0.0.1";
       });
       
+      _initForegroundTask();
     } catch (e) {
       debugPrint('Error inicializando: $e');
+    }
+  }
+
+  void _initForegroundTask() {
+    try {
+      FlutterForegroundTask.init(
+        androidNotificationOptions: AndroidNotificationOptions(
+          channelId: 'worshipcam_service',
+          channelName: 'Transmisión en Segundo Plano',
+          channelDescription: 'Mantiene activa la transmisión de video cuando la pantalla se apaga.',
+          channelImportance: NotificationChannelImportance.LOW,
+          priority: NotificationPriority.LOW,
+          iconData: const NotificationIconData(
+            resType: ResourceType.mipmap,
+            resPrefix: 'ic',
+            name: 'launcher',
+          ),
+        ),
+        iosNotificationOptions: const IOSNotificationOptions(
+          showNotification: true,
+          playSound: false,
+        ),
+        foregroundTaskOptions: const ForegroundTaskOptions(
+          interval: 5000,
+          isOnceEvent: false,
+          autoRunOnBoot: false,
+          allowWakeLock: true,
+          allowWifiLock: true,
+        ),
+      );
+    } catch (e) {
+      debugPrint("Error init ForegroundTask: $e");
     }
   }
 
@@ -187,6 +236,18 @@ class _CameraScreenState extends State<CameraScreen> {
     setState(() {
       _isStreaming = true;
     });
+
+    try {
+      if (await FlutterForegroundTask.isRunningService == false) {
+        FlutterForegroundTask.startService(
+          notificationTitle: 'Transmitiendo a OBS...',
+          notificationText: 'WorshipCam está ejecutándose en segundo plano.',
+          callback: startCallback,
+        );
+      }
+    } catch (e) {
+      debugPrint("ForegroundTask no iniciado en entorno de pruebas: $e");
+    }
   }
 
   void _stopWebRTCStream() {
@@ -196,6 +257,12 @@ class _CameraScreenState extends State<CameraScreen> {
     setState(() {
       _isStreaming = false;
     });
+
+    try {
+      FlutterForegroundTask.stopService();
+    } catch (e) {
+      // Ignorar en test
+    }
   }
 
   @override
