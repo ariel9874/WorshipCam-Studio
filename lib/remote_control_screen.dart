@@ -3,6 +3,7 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
+import 'package:nsd/nsd.dart';
 
 class RemoteControlScreen extends StatefulWidget {
   const RemoteControlScreen({Key? key}) : super(key: key);
@@ -16,6 +17,7 @@ class _RemoteControlScreenState extends State<RemoteControlScreen> {
   WebSocketChannel? _channel; // Canal para JSON commands
   bool _isConnected = false;
   bool _isTunnelActive = false;
+  bool _isDiscovering = false;
 
   // WebRTC Monitor
   final RTCVideoRenderer _remoteRenderer = RTCVideoRenderer();
@@ -58,6 +60,43 @@ class _RemoteControlScreenState extends State<RemoteControlScreen> {
       }
     } catch (e) {
       debugPrint("Error ejecutando adb: $e");
+    }
+  }
+
+  Future<void> _discoverDevice() async {
+    setState(() => _isDiscovering = true);
+    try {
+      final discovery = await startDiscovery('_worshipcam._tcp');
+      discovery.addListener(() {
+        if (discovery.services.isNotEmpty) {
+          final service = discovery.services.first;
+          // nsd package usa 'host'
+          final ip = service.host;
+          if (ip != null) {
+            if (_isDiscovering) {
+              setState(() {
+                _ipController.text = ip;
+                _isDiscovering = false;
+              });
+              stopDiscovery(discovery);
+              _connect();
+            }
+          }
+        }
+      });
+      // Timeout
+      Future.delayed(const Duration(seconds: 5), () {
+        if (_isDiscovering) {
+          stopDiscovery(discovery);
+          if (mounted) {
+            setState(() => _isDiscovering = false);
+            ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('No se encontraron celulares en la red.')));
+          }
+        }
+      });
+    } catch (e) {
+      if (mounted) setState(() => _isDiscovering = false);
+      debugPrint('Error mDNS: $e');
     }
   }
 
@@ -313,6 +352,19 @@ class _RemoteControlScreenState extends State<RemoteControlScreen> {
                             ],
                           ),
                         ),
+                      const SizedBox(height: 10),
+                      ElevatedButton.icon(
+                        onPressed: _isDiscovering ? null : _discoverDevice,
+                        icon: _isDiscovering 
+                          ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2))
+                          : const Icon(Icons.wifi_tethering),
+                        label: Text(_isDiscovering ? 'Buscando celular en Wi-Fi...' : 'Auto-Descubrir (mDNS)'),
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: Colors.orangeAccent,
+                          foregroundColor: Colors.black,
+                          minimumSize: const Size.fromHeight(40),
+                        ),
+                      ),
                       const SizedBox(height: 10),
                       TextField(
                         controller: _ipController,

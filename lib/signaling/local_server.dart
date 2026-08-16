@@ -8,11 +8,13 @@ import 'package:web_socket_channel/web_socket_channel.dart';
 import 'web_client.dart';
 
 import 'dart:io';
+import 'package:nsd/nsd.dart';
 
 class LocalSignalingServer {
   final int port = 8080;
   final Map<String, WebSocketChannel> webrtcClients = {};
   HttpServer? _httpServer;
+  Registration? _nsdRegistration;
   
   // Callbacks para comunicar con main.dart (WebRTC)
   Function(String clientId, Map<String, dynamic> message)? onMessageReceived;
@@ -73,6 +75,17 @@ class LocalSignalingServer {
     // Iniciar el servidor escuchando en todas las interfaces de red (0.0.0.0)
     _httpServer = await io.serve(router.call, '0.0.0.0', port);
     debugPrint('Servidor Local corriendo en puerto $port');
+
+    try {
+      _nsdRegistration = await register(const Service(
+        name: 'WorshipCam',
+        type: '_worshipcam._tcp',
+        port: 8080,
+      ));
+      debugPrint('Servicio mDNS registrado: ${_nsdRegistration?.service.name}');
+    } catch (e) {
+      debugPrint('Error registrando mDNS: $e');
+    }
   }
 
   Future<void> stop() async {
@@ -81,6 +94,15 @@ class LocalSignalingServer {
       client.sink.close();
     }
     webrtcClients.clear();
+    
+    if (_nsdRegistration != null) {
+      try {
+        await unregister(_nsdRegistration!);
+        _nsdRegistration = null;
+      } catch (e) {
+        debugPrint('Error quitando mDNS: $e');
+      }
+    }
     await _httpServer?.close(force: true);
   }
 
