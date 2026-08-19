@@ -340,6 +340,7 @@ class _CameraScreenState extends State<CameraScreen> {
   Widget build(BuildContext context) {
     if (!_cameraService.isReady) {
       return const Scaffold(
+        backgroundColor: Colors.black,
         body: Center(child: CircularProgressIndicator(color: Colors.white)),
       );
     }
@@ -348,6 +349,7 @@ class _CameraScreenState extends State<CameraScreen> {
         (!_cameraService.isUsbMode && _cameraService.localStream == null) || 
         (_cameraService.isUsbMode && _cameraService.usbCameraController == null)) {
       return Scaffold(
+        backgroundColor: Colors.black,
         body: Center(
           child: Padding(
             padding: const EdgeInsets.all(20.0),
@@ -373,11 +375,16 @@ class _CameraScreenState extends State<CameraScreen> {
       );
     }
 
+    bool isConnected = _connectedClientsCount > 0 || _isRemoteControlConnected;
+
     return Scaffold(
+      backgroundColor: Colors.black,
       body: Stack(
         fit: StackFit.expand,
         children: [
-          Positioned.fill(
+          // Vista de cámara (oculta o muy oscurecida si está conectado)
+          Opacity(
+            opacity: isConnected ? 0.3 : 1.0,
             child: _cameraService.isUsbMode 
               ? cam.CameraPreview(_cameraService.usbCameraController!)
               : RTCVideoView(
@@ -386,91 +393,123 @@ class _CameraScreenState extends State<CameraScreen> {
                 ),
           ),
           
-          SafeArea(
-            child: Column(
-              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-              children: [
-                Padding(
-                  padding: const EdgeInsets.all(16.0),
-                  child: Column(
-                    children: [
-                      Row(
-                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                        children: [
-                          GestureDetector(
-                            onTap: _showOBSInstructions,
-                            child: _buildStatusChip(
-                              Icons.visibility, 
-                              _connectedClientsCount > 0 ? "ESPECTADORES: $_connectedClientsCount" : "ESPECTADORES: 0",
-                              color: _connectedClientsCount > 0 ? Colors.green : Colors.black54
-                            ),
-                          ),
-                          GestureDetector(
-                            onTap: () async {
-                              ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Actualizando IP...')));
-                              final ip = await NetworkUtils.fetchLocalIp();
-                              setState(() => _localIp = ip);
-                            },
-                            child: _buildStatusChip(Icons.refresh, _localIp),
-                          ),
-                        ],
-                      ),
-                      const SizedBox(height: 10),
-                      Row(
-                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                        children: [
-                          _buildStatusChip(
-                            Icons.gamepad, 
-                            _isRemoteControlConnected ? "CONTROL REMOTO: ON" : "CONTROL REMOTO: OFF",
-                            color: _isRemoteControlConnected ? Colors.purpleAccent : Colors.black54
-                          ),
-                          _buildStatusChip(
-                            Icons.high_quality, 
-                            "${_cameraService.currentResolution.name.toUpperCase()} @ ${_cameraService.currentFps}fps",
-                            color: Colors.blueAccent
-                          ),
-                        ],
-                      ),
-                    ],
-                  ),
-                ),
-                Container(
-                  padding: const EdgeInsets.all(24.0),
-                  decoration: const BoxDecoration(
-                    gradient: LinearGradient(
-                      begin: Alignment.bottomCenter,
-                      end: Alignment.topCenter,
-                      colors: [Colors.black87, Colors.transparent],
+          if (isConnected)
+            // UI Minimalista (Tally Light)
+            Center(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Container(
+                    width: 80,
+                    height: 80,
+                    decoration: BoxDecoration(
+                      color: Colors.red,
+                      shape: BoxShape.circle,
+                      boxShadow: [
+                        BoxShadow(
+                          color: Colors.red.withOpacity(0.6),
+                          blurRadius: 30,
+                          spreadRadius: 10,
+                        )
+                      ]
                     ),
                   ),
-                  child: Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-                    children: [
-                      IconButton(
-                        icon: const Icon(Icons.settings, color: Colors.white, size: 30),
-                        onPressed: _showSettingsPanel,
-                      ),
-                      FloatingActionButton(
-                        backgroundColor: _isStreaming ? Colors.green : Colors.redAccent,
-                        onPressed: () {
-                          if (_isStreaming) {
-                            _stopStreaming();
-                          } else {
-                            _startStreaming();
-                          }
-                        },
-                        child: Icon(_isStreaming ? Icons.stop : Icons.live_tv, color: Colors.white),
-                      ),
-                      IconButton(
-                        icon: const Icon(Icons.gamepad, color: Colors.white, size: 30),
-                        onPressed: () {},
-                      ),
-                    ],
+                  const SizedBox(height: 30),
+                  const Text("EN VIVO", style: TextStyle(color: Colors.redAccent, fontSize: 24, fontWeight: FontWeight.bold, letterSpacing: 2)),
+                  const SizedBox(height: 10),
+                  const Text("Controlado desde Windows", style: TextStyle(color: Colors.white54, fontSize: 14)),
+                  const SizedBox(height: 50),
+                  TextButton.icon(
+                    onPressed: () {
+                      // Desconectar forzosamente para mostrar la UI completa
+                      _signalingServer?.sendMessageToAll({'type': 'disconnect'});
+                      setState(() {
+                        _connectedClientsCount = 0;
+                        _isRemoteControlConnected = false;
+                      });
+                    },
+                    icon: const Icon(Icons.lock_open, color: Colors.white70),
+                    label: const Text("Forzar Desbloqueo", style: TextStyle(color: Colors.white70)),
+                  )
+                ],
+              ),
+            )
+          else
+            // UI Completa (Modo Standby)
+            SafeArea(
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  Padding(
+                    padding: const EdgeInsets.all(16.0),
+                    child: Column(
+                      children: [
+                        Row(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            GestureDetector(
+                              onTap: _showOBSInstructions,
+                              child: Container(
+                                padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
+                                decoration: BoxDecoration(
+                                  color: Colors.blueAccent.withOpacity(0.2),
+                                  borderRadius: BorderRadius.circular(30),
+                                  border: Border.all(color: Colors.blueAccent)
+                                ),
+                                child: Row(
+                                  children: [
+                                    const Icon(Icons.qr_code, color: Colors.blueAccent),
+                                    const SizedBox(width: 10),
+                                    Text("IP: $_localIp", style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 16)),
+                                  ],
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 20),
+                        const Text("Esperando conexión de OBS o Panel de Control...", 
+                          style: TextStyle(color: Colors.white70), 
+                          textAlign: TextAlign.center
+                        ),
+                      ],
+                    ),
                   ),
-                )
-              ],
-            ),
-          )
+                  Container(
+                    padding: const EdgeInsets.all(24.0),
+                    decoration: const BoxDecoration(
+                      gradient: LinearGradient(
+                         begin: Alignment.bottomCenter,
+                         end: Alignment.topCenter,
+                         colors: [Colors.black, Colors.transparent],
+                      ),
+                    ),
+                    child: Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                      children: [
+                        IconButton(
+                          icon: const Icon(Icons.settings, color: Colors.white70, size: 30),
+                          onPressed: _showSettingsPanel,
+                          tooltip: "Ajustes Manuales",
+                        ),
+                        FloatingActionButton.extended(
+                          backgroundColor: _isStreaming ? Colors.green : Colors.white24,
+                          onPressed: () {
+                            if (_isStreaming) {
+                              _stopStreaming();
+                            } else {
+                              _startStreaming();
+                            }
+                          },
+                          icon: Icon(_isStreaming ? Icons.stop : Icons.power_settings_new, color: Colors.white),
+                          label: Text(_isStreaming ? "DETENER" : "INICIAR SERVIDOR", style: const TextStyle(color: Colors.white)),
+                        ),
+                      ],
+                    ),
+                  )
+                ],
+              ),
+            )
         ],
       ),
     );

@@ -68,11 +68,15 @@ class _RemoteControlScreenState extends State<RemoteControlScreen> {
   void _connect() {
     if (_ipController.text.isNotEmpty) {
       _client?.connect(_ipController.text);
+      if (!_isMonitoring) {
+        _startVideoMonitor();
+      }
     }
   }
 
   void _disconnect() {
     _client?.disconnect();
+    _stopVideoMonitor();
   }
 
   Future<void> _startVideoMonitor() async {
@@ -161,105 +165,78 @@ class _RemoteControlScreenState extends State<RemoteControlScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: Colors.transparent,
+      backgroundColor: const Color(0xFF1A1A1A), // Dark modern theme
       appBar: AppBar(
-        title: const Text('WorshipCam Remote Panel'),
-        backgroundColor: const Color(0xFF282A36).withValues(alpha: 0.8),
+        title: const Text('WorshipCam Studio', style: TextStyle(fontWeight: FontWeight.w600, letterSpacing: 1.2)),
+        backgroundColor: const Color(0xFF121212),
         elevation: 0,
         actions: [
           Container(
             margin: const EdgeInsets.all(12),
-            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
             decoration: BoxDecoration(
-              color: _isConnected ? Colors.green : Colors.red,
+              color: _isConnected ? Colors.green.withOpacity(0.2) : Colors.red.withOpacity(0.2),
+              border: Border.all(color: _isConnected ? Colors.green : Colors.redAccent),
               borderRadius: BorderRadius.circular(20),
             ),
             child: Center(
               child: Text(
                 _isConnected ? "CONECTADO" : "DESCONECTADO",
-                style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 12),
+                style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12, color: _isConnected ? Colors.greenAccent : Colors.redAccent),
               ),
             ),
           )
         ],
       ),
-      body: Container(
-        decoration: const BoxDecoration(
-          image: DecorationImage(
-            image: AssetImage('assets/images/background.jpg'),
-            fit: BoxFit.cover,
-          ),
-        ),
-        child: Row(
-          children: [
-            // Área de Video
-            Expanded(
-              flex: 2,
-              child: Container(
-                margin: const EdgeInsets.all(20),
-                decoration: BoxDecoration(
-                  color: Colors.black87,
-                  borderRadius: BorderRadius.circular(15),
-                  border: Border.all(color: Colors.white24),
-                  boxShadow: [
-                    BoxShadow(color: Colors.black.withValues(alpha: 0.5), blurRadius: 10, spreadRadius: 2)
-                  ]
-                ),
-                child: ClipRRect(
-                  borderRadius: BorderRadius.circular(15),
-                  child: Stack(
-                    fit: StackFit.expand,
-                    children: [
-                      if (_isMonitoring)
-                        RTCVideoView(
-                          _remoteRenderer,
-                          objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitContain,
-                        )
-                      else
-                        const Center(
-                          child: Column(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              Icon(Icons.videocam_off, color: Colors.white54, size: 60),
-                              SizedBox(height: 10),
-                              Text("Video Monitor Inactivo", style: TextStyle(color: Colors.white54)),
-                            ],
-                          ),
-                        ),
-                      
-                      Positioned(
-                        bottom: 10,
-                        right: 10,
-                        child: FloatingActionButton(
-                          mini: true,
-                          backgroundColor: _isMonitoring ? Colors.red : Colors.blueAccent,
-                          onPressed: () {
-                            if (_isMonitoring) {
-                              _stopVideoMonitor();
-                            } else {
-                              if (_ipController.text.isNotEmpty) {
-                                _startVideoMonitor();
-                              } else {
-                                ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Ingresa la IP primero')));
-                              }
-                            }
-                          },
-                          child: Icon(_isMonitoring ? Icons.stop : Icons.play_arrow, color: Colors.white),
-                        ),
+      body: Row(
+        children: [
+          // Área de Video
+          Expanded(
+            flex: 3,
+            child: Container(
+              margin: const EdgeInsets.all(24),
+              decoration: BoxDecoration(
+                color: Colors.black,
+                borderRadius: BorderRadius.circular(16),
+                border: Border.all(color: const Color(0xFF333333), width: 2),
+                boxShadow: [
+                  BoxShadow(color: Colors.black.withOpacity(0.4), blurRadius: 15, offset: const Offset(0, 10))
+                ]
+              ),
+              child: ClipRRect(
+                borderRadius: BorderRadius.circular(14),
+                child: Stack(
+                  fit: StackFit.expand,
+                  children: [
+                    if (_isMonitoring)
+                      RTCVideoView(
+                        _remoteRenderer,
+                        objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitContain,
                       )
-                    ],
-                  ),
+                    else
+                      const Center(
+                        child: Column(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Icon(Icons.videocam_off_outlined, color: Colors.white24, size: 80),
+                            SizedBox(height: 16),
+                            Text("Esperando conexión de cámara...", style: TextStyle(color: Colors.white54, fontSize: 16)),
+                          ],
+                        ),
+                      ),
+                  ],
                 ),
               ),
             ),
+          ),
 
-            // Panel de Control
-            Container(
-              width: 350,
-              decoration: BoxDecoration(
-                color: const Color(0xFF282A36).withValues(alpha: 0.95),
-                border: const Border(left: BorderSide(color: Colors.white12)),
-              ),
+          // Panel de Control
+          Container(
+            width: 380,
+            decoration: const BoxDecoration(
+              color: Color(0xFF222222),
+              border: Border(left: BorderSide(color: Color(0xFF333333))),
+            ),
               child: ListView(
                 padding: const EdgeInsets.all(20),
                 children: [
@@ -323,18 +300,28 @@ class _RemoteControlScreenState extends State<RemoteControlScreen> {
                   const Text("CALIDAD", style: TextStyle(color: Colors.greenAccent, fontWeight: FontWeight.bold)),
                   const SizedBox(height: 10),
 
-                  _buildDropdownRow(
-                    title: "Resolución:",
-                    items: const ['max', 'ultraHigh', 'veryHigh', 'high', 'medium', 'low'],
-                    onChanged: (val) => _client?.sendCommand('set_resolution', val),
+                  _buildSegmentedControl(
+                    title: "Resolución",
+                    items: const ['max', 'high', 'medium'],
+                    labels: const ['4K/Max', '1080p', '720p'],
+                    selectedValue: _selectedRes,
+                    onChanged: (val) {
+                      setState(() => _selectedRes = val);
+                      _client?.sendCommand('set_resolution', val);
+                    },
                   ),
                   
-                  const SizedBox(height: 10),
+                  const SizedBox(height: 20),
                   
-                  _buildDropdownRow(
-                    title: "FPS:",
+                  _buildSegmentedControl(
+                    title: "Velocidad (FPS)",
                     items: const ['24', '30', '60'],
-                    onChanged: (val) => _client?.sendCommand('set_fps', int.parse(val)),
+                    labels: const ['24fps', '30fps', '60fps'],
+                    selectedValue: _selectedFps,
+                    onChanged: (val) {
+                      setState(() => _selectedFps = val);
+                      _client?.sendCommand('set_fps', int.parse(val));
+                    },
                   ),
                   
                 ],
@@ -346,34 +333,79 @@ class _RemoteControlScreenState extends State<RemoteControlScreen> {
     );
   }
 
+  String _selectedRes = 'max';
+  String _selectedFps = '30';
+
   Widget _buildControlCard({required String title, required IconData icon, required VoidCallback onTap}) {
-    return Card(
-      color: Colors.black54,
-      margin: const EdgeInsets.only(bottom: 10),
-      child: ListTile(
-        leading: Icon(icon, color: Colors.white70),
-        title: Text(title, style: const TextStyle(color: Colors.white)),
-        trailing: const Icon(Icons.chevron_right, color: Colors.white38),
-        onTap: _isConnected ? onTap : null,
-        enabled: _isConnected,
+    return InkWell(
+      onTap: _isConnected ? onTap : null,
+      borderRadius: BorderRadius.circular(10),
+      child: Container(
+        margin: const EdgeInsets.only(bottom: 10),
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+        decoration: BoxDecoration(
+          color: const Color(0xFF2A2A2A),
+          borderRadius: BorderRadius.circular(10),
+          border: Border.all(color: const Color(0xFF333333)),
+        ),
+        child: Row(
+          children: [
+            Icon(icon, color: _isConnected ? Colors.white : Colors.white38, size: 20),
+            const SizedBox(width: 16),
+            Expanded(child: Text(title, style: TextStyle(color: _isConnected ? Colors.white : Colors.white38, fontSize: 14, fontWeight: FontWeight.w500))),
+            Icon(Icons.chevron_right, color: _isConnected ? Colors.white54 : Colors.white24, size: 20),
+          ],
+        ),
       ),
     );
   }
 
-  Widget _buildDropdownRow({required String title, required List<String> items, required Function(String) onChanged}) {
-    return Row(
-      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+  Widget _buildSegmentedControl({
+    required String title, 
+    required List<String> items, 
+    required List<String> labels, 
+    required String selectedValue,
+    required Function(String) onChanged
+  }) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Text(title, style: const TextStyle(color: Colors.white)),
-        DropdownButton<String>(
-          dropdownColor: Colors.black87,
-          style: const TextStyle(color: Colors.white),
-          hint: const Text("Sel", style: TextStyle(color: Colors.white54)),
-          items: items.map((e) => DropdownMenuItem(value: e, child: Text(e.toUpperCase()))).toList(),
-          onChanged: _isConnected ? (val) {
-            if (val != null) onChanged(val);
-          } : null,
-        ),
+        Text(title, style: const TextStyle(color: Colors.white70, fontSize: 13)),
+        const SizedBox(height: 8),
+        Container(
+          height: 40,
+          decoration: BoxDecoration(
+            color: const Color(0xFF1A1A1A),
+            borderRadius: BorderRadius.circular(8),
+            border: Border.all(color: const Color(0xFF333333)),
+          ),
+          child: Row(
+            children: List.generate(items.length, (index) {
+              final isSelected = items[index] == selectedValue;
+              return Expanded(
+                child: GestureDetector(
+                  onTap: _isConnected ? () => onChanged(items[index]) : null,
+                  child: Container(
+                    decoration: BoxDecoration(
+                      color: isSelected ? Colors.blueAccent : Colors.transparent,
+                      borderRadius: BorderRadius.circular(7),
+                    ),
+                    child: Center(
+                      child: Text(
+                        labels[index], 
+                        style: TextStyle(
+                          color: _isConnected ? (isSelected ? Colors.white : Colors.white54) : Colors.white24,
+                          fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
+                          fontSize: 13
+                        )
+                      ),
+                    ),
+                  ),
+                ),
+              );
+            }),
+          ),
+        )
       ],
     );
   }
