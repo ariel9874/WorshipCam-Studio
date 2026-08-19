@@ -65,7 +65,7 @@ void main() {
 
   test('Enrutamiento de mensajes JSON funciona', () async {
     String? receivedMessage;
-    server.onMessageReceived = (clientId, message) {
+    server.onMessageReceived = (clientId, messageStr, message) {
       receivedMessage = message['type'];
     };
 

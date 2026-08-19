@@ -103,7 +103,12 @@ class _RemoteControlScreenState extends State<RemoteControlScreen> {
   void _connect() {
     if (_ipController.text.isEmpty) return;
 
-    final url = 'ws://${_ipController.text}:8080/control';
+    String ipStr = _ipController.text.trim();
+    if (ipStr.contains(':')) {
+      ipStr = ipStr.split(':')[0];
+      _ipController.text = ipStr;
+    }
+    final url = 'ws://$ipStr:8080/control';
     try {
       _channel = WebSocketChannel.connect(Uri.parse(url));
       
@@ -164,9 +169,7 @@ class _RemoteControlScreenState extends State<RemoteControlScreen> {
     _webrtcChannel = WebSocketChannel.connect(Uri.parse(url));
     
     final configuration = {
-      'iceServers': [
-        {'urls': 'stun:stun.l.google.com:19302'}
-      ]
+      'iceServers': [] // Vacío para red local estricta
     };
     
     _peerConnection = await createPeerConnection(configuration);
@@ -261,10 +264,11 @@ class _RemoteControlScreenState extends State<RemoteControlScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: const Color(0xFF1E1E2E), // Dark theme
+      backgroundColor: Colors.transparent, // Transparent to show background
       appBar: AppBar(
         title: const Text('WorshipCam Remote Panel'),
-        backgroundColor: const Color(0xFF282A36),
+        backgroundColor: const Color(0xFF282A36).withValues(alpha: 0.8),
+        elevation: 0,
         actions: [
           Container(
             margin: const EdgeInsets.all(12),
@@ -282,10 +286,17 @@ class _RemoteControlScreenState extends State<RemoteControlScreen> {
           )
         ],
       ),
-      body: Row(
-        children: [
-          // Área de Video
-          Expanded(
+      body: Container(
+        decoration: const BoxDecoration(
+          image: DecorationImage(
+            image: AssetImage('assets/images/background.jpg'),
+            fit: BoxFit.cover,
+          ),
+        ),
+        child: Row(
+          children: [
+            // Área de Video
+            Expanded(
             flex: 2,
             child: Container(
               color: Colors.black,
@@ -322,170 +333,182 @@ class _RemoteControlScreenState extends State<RemoteControlScreen> {
                     ),
             ),
           ),
-          // Área de Controles
-          Container(
-            width: 400,
-            padding: const EdgeInsets.all(20),
-            color: const Color(0xFF1E1E2E),
-            child: SingleChildScrollView(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [
-              // Connection Section
-              Card(
-                color: const Color(0xFF282A36),
-                child: Padding(
-                  padding: const EdgeInsets.all(16.0),
-                  child: Column(
-                    children: [
-                      const Text("Conexión a Celular", style: TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold)),
-                      if (_isTunnelActive)
-                        Container(
-                          margin: const EdgeInsets.only(top: 10, bottom: 10),
-                          padding: const EdgeInsets.all(8),
-                          decoration: BoxDecoration(color: Colors.green.withOpacity(0.2), borderRadius: BorderRadius.circular(8)),
-                          child: const Row(
+            // Área de Controles
+            Container(
+              width: 400,
+              padding: const EdgeInsets.all(20),
+              color: const Color(0xFF1E1E2E).withValues(alpha: 0.8),
+              child: SingleChildScrollView(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    // Connection Section
+                    Card(
+                      color: const Color(0xFF282A36).withValues(alpha: 0.7),
+                      elevation: 5,
+                      child: Padding(
+                        padding: const EdgeInsets.all(16.0),
+                        child: Column(
+                          children: [
+                            const Text("Conexión a Celular", style: TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold)),
+                            if (_isTunnelActive)
+                              Container(
+                                margin: const EdgeInsets.only(top: 10, bottom: 10),
+                                padding: const EdgeInsets.all(8),
+                                decoration: BoxDecoration(color: Colors.green.withOpacity(0.2), borderRadius: BorderRadius.circular(8)),
+                                child: const Row(
+                                  children: [
+                                    Icon(Icons.usb, color: Colors.greenAccent),
+                                    SizedBox(width: 10),
+                                    Expanded(child: Text("Túnel USB activo. Conexión garantizada por cable.", style: TextStyle(color: Colors.greenAccent, fontSize: 12))),
+                                  ],
+                                ),
+                              ),
+                            const SizedBox(height: 10),
+                            ElevatedButton.icon(
+                              onPressed: _isDiscovering ? null : _discoverDevice,
+                              icon: _isDiscovering 
+                                ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2))
+                                : const Icon(Icons.wifi_tethering),
+                              label: Text(_isDiscovering ? 'Buscando celular en Wi-Fi...' : 'Auto-Descubrir (mDNS)'),
+                              style: ElevatedButton.styleFrom(
+                                backgroundColor: Colors.orangeAccent,
+                                foregroundColor: Colors.black,
+                                minimumSize: const Size.fromHeight(40),
+                              ),
+                            ),
+                            const SizedBox(height: 10),
+                            TextField(
+                              controller: _ipController,
+                              style: const TextStyle(color: Colors.white),
+                              decoration: const InputDecoration(
+                                labelText: 'IP del celular (ej. 192.168.1.15)',
+                                labelStyle: TextStyle(color: Colors.grey),
+                                enabledBorder: OutlineInputBorder(borderSide: BorderSide(color: Colors.grey)),
+                                focusedBorder: OutlineInputBorder(borderSide: BorderSide(color: Colors.blueAccent)),
+                              ),
+                            ),
+                            const SizedBox(height: 10),
+                            ElevatedButton(
+                              onPressed: _isConnected ? _disconnect : _connect,
+                              style: ElevatedButton.styleFrom(
+                                backgroundColor: _isConnected ? Colors.redAccent : Colors.blueAccent,
+                                minimumSize: const Size.fromHeight(50),
+                              ),
+                              child: Text(_isConnected ? 'Desconectar' : 'Conectar'),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 20),
+
+                    // Control Section (Only enabled if connected)
+                    Opacity(
+                      opacity: _isConnected ? 1.0 : 0.5,
+                      child: Card(
+                        color: const Color(0xFF282A36).withValues(alpha: 0.7),
+                        elevation: 5,
+                        child: Padding(
+                          padding: const EdgeInsets.all(16.0),
+                          child: Column(
                             children: [
-                              Icon(Icons.usb, color: Colors.greenAccent),
-                              SizedBox(width: 10),
-                              Expanded(child: Text("Túnel USB activo. Conexión garantizada por cable.", style: TextStyle(color: Colors.greenAccent, fontSize: 12))),
+                              const Text("Panel de Control Remoto", style: TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold)),
+                              const SizedBox(height: 20),
+                              
+                              // Switch Lens Button
+                              ElevatedButton.icon(
+                                onPressed: _isConnected ? () => _sendCommand('switch_lens', 'next') : null,
+                                icon: const Icon(Icons.cameraswitch),
+                                label: const Text('Cambiar Lente Físico'),
+                                style: ElevatedButton.styleFrom(
+                                  backgroundColor: Colors.purpleAccent,
+                                  minimumSize: const Size.fromHeight(50),
+                                ),
+                              ),
+                              const SizedBox(height: 10),
+                              // Toggle Flash Button
+                              ElevatedButton.icon(
+                                onPressed: _isConnected ? () => _sendCommand('toggle_flash', null) : null,
+                                icon: const Icon(Icons.highlight),
+                                label: const Text('Alternar Linterna (Flash)'),
+                                style: ElevatedButton.styleFrom(
+                                  backgroundColor: Colors.amber,
+                                  foregroundColor: Colors.black,
+                                  minimumSize: const Size.fromHeight(50),
+                                ),
+                              ),
+                              const SizedBox(height: 20),
+
+                              // Resolution Selector
+                              Row(
+                                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                                children: [
+                                  const Text("Calidad WebRTC:", style: TextStyle(color: Colors.white)),
+                                  DropdownButton<String>(
+                                    dropdownColor: Colors.black87,
+                                    value: 'veryHigh', // Por defecto
+                                    style: const TextStyle(color: Colors.white),
+                                    items: const [
+                                      DropdownMenuItem(value: 'high', child: Text('720p (High)')),
+                                      DropdownMenuItem(value: 'veryHigh', child: Text('1080p (VeryHigh)')),
+                                      DropdownMenuItem(value: 'max', child: Text('Máxima')),
+                                    ],
+                                    onChanged: _isConnected ? (val) {
+                                      _sendCommand('set_resolution', val);
+                                    } : null,
+                                  ),
+                                ],
+                              ),
+
+                              // FPS Selector
+                              Row(
+                                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                                children: [
+                                  const Text("Velocidad (FPS):", style: TextStyle(color: Colors.white)),
+                                  DropdownButton<int>(
+                                    dropdownColor: Colors.black87,
+                                    value: 30, // Por defecto
+                                    style: const TextStyle(color: Colors.white),
+                                    items: const [
+                                      DropdownMenuItem(value: 30, child: Text('30 FPS')),
+                                      DropdownMenuItem(value: 60, child: Text('60 FPS')),
+                                    ],
+                                    onChanged: _isConnected ? (val) {
+                                      _sendCommand('set_fps', val);
+                                    } : null,
+                                  ),
+                                ],
+                              ),
                             ],
                           ),
                         ),
-                      const SizedBox(height: 10),
-                      ElevatedButton.icon(
-                        onPressed: _isDiscovering ? null : _discoverDevice,
-                        icon: _isDiscovering 
-                          ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2))
-                          : const Icon(Icons.wifi_tethering),
-                        label: Text(_isDiscovering ? 'Buscando celular en Wi-Fi...' : 'Auto-Descubrir (mDNS)'),
-                        style: ElevatedButton.styleFrom(
-                          backgroundColor: Colors.orangeAccent,
-                          foregroundColor: Colors.black,
-                          minimumSize: const Size.fromHeight(40),
-                        ),
                       ),
-                      const SizedBox(height: 10),
-                      TextField(
-                        controller: _ipController,
-                        style: const TextStyle(color: Colors.white),
-                        decoration: const InputDecoration(
-                          labelText: 'IP del celular (ej. 192.168.1.15)',
-                          labelStyle: TextStyle(color: Colors.grey),
-                          enabledBorder: OutlineInputBorder(borderSide: BorderSide(color: Colors.grey)),
-                          focusedBorder: OutlineInputBorder(borderSide: BorderSide(color: Colors.blueAccent)),
-                        ),
-                      ),
-                      const SizedBox(height: 10),
-                      ElevatedButton(
-                        onPressed: _isConnected ? _disconnect : _connect,
-                        style: ElevatedButton.styleFrom(
-                          backgroundColor: _isConnected ? Colors.redAccent : Colors.blueAccent,
-                          minimumSize: const Size.fromHeight(50),
-                        ),
-                        child: Text(_isConnected ? 'Desconectar' : 'Conectar'),
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-              const SizedBox(height: 20),
-
-              // Control Section (Only enabled if connected)
-              Opacity(
-                opacity: _isConnected ? 1.0 : 0.5,
-                child: Card(
-                  color: const Color(0xFF282A36),
-                  child: Padding(
-                    padding: const EdgeInsets.all(16.0),
-                    child: Column(
-                      children: [
-                        const Text("Panel de Control Remoto", style: TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold)),
-                        const SizedBox(height: 20),
-                        
-                        // Switch Lens Button
-                        ElevatedButton.icon(
-                          onPressed: _isConnected ? () => _sendCommand('switch_lens', 'next') : null,
-                          icon: const Icon(Icons.cameraswitch),
-                          label: const Text('Cambiar Lente Físico'),
-                          style: ElevatedButton.styleFrom(
-                            backgroundColor: Colors.purpleAccent,
-                            minimumSize: const Size.fromHeight(50),
-                          ),
-                        ),
-                        const SizedBox(height: 10),
-                        // Toggle Flash Button
-                        ElevatedButton.icon(
-                          onPressed: _isConnected ? () => _sendCommand('toggle_flash', null) : null,
-                          icon: const Icon(Icons.highlight),
-                          label: const Text('Alternar Linterna (Flash)'),
-                          style: ElevatedButton.styleFrom(
-                            backgroundColor: Colors.amber,
-                            foregroundColor: Colors.black,
-                            minimumSize: const Size.fromHeight(50),
-                          ),
-                        ),
-                        const SizedBox(height: 20),
-
-                        // Resolution Selector
-                        Row(
-                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                          children: [
-                            const Text("Calidad WebRTC:", style: TextStyle(color: Colors.white)),
-                            DropdownButton<String>(
-                              dropdownColor: Colors.black87,
-                              value: 'veryHigh', // Por defecto
-                              style: const TextStyle(color: Colors.white),
-                              items: const [
-                                DropdownMenuItem(value: 'high', child: Text('720p (High)')),
-                                DropdownMenuItem(value: 'veryHigh', child: Text('1080p (VeryHigh)')),
-                                DropdownMenuItem(value: 'max', child: Text('Máxima')),
-                              ],
-                              onChanged: _isConnected ? (val) {
-                                _sendCommand('set_resolution', val);
-                              } : null,
-                            ),
-                          ],
-                        ),
-
-                        // FPS Selector
-                        Row(
-                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                          children: [
-                            const Text("Velocidad (FPS):", style: TextStyle(color: Colors.white)),
-                            DropdownButton<int>(
-                              dropdownColor: Colors.black87,
-                              value: 30, // Por defecto
-                              style: const TextStyle(color: Colors.white),
-                              items: const [
-                                DropdownMenuItem(value: 30, child: Text('30 FPS')),
-                                DropdownMenuItem(value: 60, child: Text('60 FPS')),
-                              ],
-                              onChanged: _isConnected ? (val) {
-                                _sendCommand('set_fps', val);
-                              } : null,
-                            ),
-                          ],
-                        ),
-                      ],
                     ),
-                  ),
+                    if (!_isMonitoring) ...[
+                      const SizedBox(height: 20),
+                      ElevatedButton.icon(
+                        onPressed: _isConnected ? _startVideoMonitor : null,
+                        icon: const Icon(Icons.play_arrow),
+                        label: const Text('Iniciar Monitor (Desconecta OBS)'),
+                        style: ElevatedButton.styleFrom(backgroundColor: Colors.green),
+                      )
+                    ],
+                    if (_isMonitoring) ...[
+                      const SizedBox(height: 20),
+                      ElevatedButton.icon(
+                        onPressed: _stopVideoMonitor,
+                        icon: const Icon(Icons.stop),
+                        label: const Text('Detener Monitor'),
+                        style: ElevatedButton.styleFrom(backgroundColor: Colors.redAccent),
+                      )
+                    ]
+                  ],
                 ),
               ),
-              if (_isMonitoring) ...[
-                const SizedBox(height: 20),
-                ElevatedButton.icon(
-                  onPressed: _stopVideoMonitor,
-                  icon: const Icon(Icons.stop),
-                  label: const Text('Detener Monitor'),
-                  style: ElevatedButton.styleFrom(backgroundColor: Colors.redAccent),
-                )
-              ]
-            ],
-          ),
+            ),
+          ],
         ),
-      ),
-        ],
       ),
     );
   }

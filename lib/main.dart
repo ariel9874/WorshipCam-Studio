@@ -2,7 +2,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:network_info_plus/network_info_plus.dart';
-import 'dart:io' show Platform;
+import 'dart:io';
+import 'package:camera/camera.dart' as cam;
 import 'signaling/local_server.dart';
 import 'remote_control_screen.dart';
 import 'services/camera_service.dart';
@@ -16,11 +17,11 @@ void startCallback() {
 
 class MyTaskHandler extends TaskHandler {
   @override
-  Future<void> onStart(DateTime timestamp, SendPort? sendPort) async {}
+  Future<void> onStart(DateTime timestamp, TaskStarter starter) async {}
   @override
-  Future<void> onEvent(DateTime timestamp, SendPort? sendPort) async {}
+  void onRepeatEvent(DateTime timestamp) {}
   @override
-  Future<void> onDestroy(DateTime timestamp, SendPort? sendPort) async {}
+  Future<void> onDestroy(DateTime timestamp, bool isTimeout) async {}
 }
 
 Future<void> main() async {
@@ -84,19 +85,67 @@ class _CameraScreenState extends State<CameraScreen> {
       _cameraService.addListener(() {
         if (mounted) setState(() {});
       });
+      _cameraService.onUsbFrame = (bytes) {
+        if (_isStreaming && _signalingServer != null) {
+          _signalingServer!.broadcastVideoFrame(bytes);
+        }
+      };
       await _cameraService.initialize();
       await _initSignalingServer();
-      
-      // Obtener IP local para mostrar al usuario
-      final ip = await NetworkInfo().getWifiIP();
-      setState(() {
-        _localIp = ip ?? "127.0.0.1";
-      });
+      await _fetchLocalIp();
       
       _initForegroundTask();
     } catch (e) {
       debugPrint('Error inicializando: $e');
     }
+  }
+
+  Future<void> _fetchLocalIp() async {
+    String? foundIp;
+    try {
+      foundIp = await NetworkInfo().getWifiIP();
+      if (foundIp == null || foundIp == "127.0.0.1" || foundIp.isEmpty) {
+        final interfaces = await NetworkInterface.list();
+        
+        // Prioridades: 1. USB Tethering, 2. Hotspot Wi-Fi, 3. Wi-Fi Client
+        final preferredNames = ['rndis0', 'usb0', 'ap0', 'swlan0', 'wlan0'];
+        
+        for (var name in preferredNames) {
+          for (var interface in interfaces) {
+            if (interface.name.toLowerCase().startsWith(name)) {
+              for (var addr in interface.addresses) {
+                if (addr.type == InternetAddressType.IPv4 && !addr.isLoopback) {
+                  foundIp = addr.address;
+                  break;
+                }
+              }
+            }
+            if (foundIp != null) break;
+          }
+          if (foundIp != null) break;
+        }
+
+        // Fallback: Cualquier interfaz que no sea loopback ni red celular (rmnet)
+        if (foundIp == null) {
+          for (var interface in interfaces) {
+            if (interface.name.toLowerCase().startsWith('rmnet')) continue;
+            for (var addr in interface.addresses) {
+              if (addr.type == InternetAddressType.IPv4 && !addr.isLoopback) {
+                foundIp = addr.address;
+                break;
+              }
+            }
+            if (foundIp != null) break;
+          }
+        }
+      }
+    } catch (e) {
+      debugPrint("Error obteniendo IP: $e");
+    }
+    
+    setState(() {
+      _localIp = foundIp ?? "127.0.0.1";
+    });
   }
 
   void _initForegroundTask() {
@@ -108,19 +157,13 @@ class _CameraScreenState extends State<CameraScreen> {
           channelDescription: 'Mantiene activa la transmisión de video cuando la pantalla se apaga.',
           channelImportance: NotificationChannelImportance.LOW,
           priority: NotificationPriority.LOW,
-          iconData: const NotificationIconData(
-            resType: ResourceType.mipmap,
-            resPrefix: 'ic',
-            name: 'launcher',
-          ),
         ),
         iosNotificationOptions: const IOSNotificationOptions(
           showNotification: true,
           playSound: false,
         ),
-        foregroundTaskOptions: const ForegroundTaskOptions(
-          interval: 5000,
-          isOnceEvent: false,
+        foregroundTaskOptions: ForegroundTaskOptions(
+          eventAction: ForegroundTaskEventAction.nothing(),
           autoRunOnBoot: false,
           allowWakeLock: true,
           allowWifiLock: true,
@@ -137,7 +180,9 @@ class _CameraScreenState extends State<CameraScreen> {
     _signalingServer!.onClientConnected = (clientId) {
       setState(() => _connectedClientsCount = 1);
       if (_isStreaming) {
-        _startWebRTCStream();
+        if (!_cameraService.isUsbMode) {
+          _startStreaming();
+        }
       }
     };
     
@@ -171,15 +216,26 @@ class _CameraScreenState extends State<CameraScreen> {
       }
     };
 
-    _signalingServer!.onMessageReceived = (clientId, message) async {
+    _signalingServer!.onMessageReceived = (clientId, clientIp, message) async {
       final type = message['type'];
       
       if (type == 'answer') {
         final answer = RTCSessionDescription(message['answer']['sdp'], message['answer']['type']);
         await _peerConnection?.setRemoteDescription(answer);
       } else if (type == 'candidate') {
+        String candStr = message['candidate']['candidate'] as String;
+        
+        // ¡LA ESTOCADA FINAL AL BUG DE WEBRTC!
+        // Si el PC nos envió su IP oculta en mDNS (.local), la descubrimos nosotros mismos
+        // usando la IP real desde donde se conectó al WebSocket, y la inyectamos a la fuerza
+        // en el candidato ICE para que WebRTC en Android sepa a quién debe contestar.
+        if (candStr.contains('.local')) {
+          candStr = candStr.replaceAll(RegExp(r'[a-f0-9\-]+\.local'), clientIp);
+          debugPrint("¡Candidato mDNS interceptado! Reemplazado por: \$clientIp");
+        }
+
         final candidate = RTCIceCandidate(
-          message['candidate']['candidate'],
+          candStr,
           message['candidate']['sdpMid'],
           message['candidate']['sdpMLineIndex'],
         );
@@ -190,46 +246,89 @@ class _CameraScreenState extends State<CameraScreen> {
     await _signalingServer!.start();
   }
 
-  Future<void> _startWebRTCStream() async {
+  Future<void> _startStreaming() async {
+    setState(() => _isStreaming = true);
+
+    if (_cameraService.isUsbMode) {
+      // En modo USB, la cámara ya genera frames vía onUsbFrame.
+      // Solo necesitamos que _isStreaming sea true.
+      return;
+    }
+
     if (_cameraService.localStream == null) return;
 
     final configuration = {
-      'iceServers': [
-        {'urls': 'stun:stun.l.google.com:19302'}
-      ]
+      'iceServers': [] // Vacío para forzar conexión 100% local (offline)
     };
-
-    // Cerrar la conexión anterior si existe
-    if (_peerConnection != null) {
-      await _peerConnection!.close();
-    }
 
     _peerConnection = await createPeerConnection(configuration);
     _cameraService.peerConnection = _peerConnection;
 
     _peerConnection!.onIceCandidate = (candidate) {
+      String modifiedCandidate = candidate.candidate ?? "";
+      
+      // Solución para el bug de WebRTC en Android Hotspot:
+      // libwebrtc ignora la interfaz ap0 (Hotspot) y solo devuelve 127.0.0.1.
+      // Reemplazamos 127.0.0.1 con la IP real del Hotspot para que OBS sepa a dónde enviar.
+      if (modifiedCandidate.contains('127.0.0.1') && _localIp != "No conectado a Wi-Fi") {
+        modifiedCandidate = modifiedCandidate.replaceAll('127.0.0.1', _localIp);
+      }
+
       _signalingServer!.sendMessageToAll({
         'type': 'candidate',
         'candidate': {
-          'candidate': candidate.candidate,
+          'candidate': modifiedCandidate,
           'sdpMid': candidate.sdpMid,
           'sdpMLineIndex': candidate.sdpMLineIndex
         }
       });
     };
 
-    _cameraService.localStream!.getTracks().forEach((track) {
-      _peerConnection!.addTrack(track, _cameraService.localStream!);
-    });
+    // Añadir tracks usando addTransceiver (Unified Plan)
+    if (_cameraService.localStream != null) {
+      for (var track in _cameraService.localStream!.getVideoTracks()) {
+        await _peerConnection!.addTransceiver(
+          track: track,
+          init: RTCRtpTransceiverInit(
+            direction: TransceiverDirection.SendOnly,
+            streams: [_cameraService.localStream!],
+          ),
+        );
+      }
+    }
 
-    final offer = await _peerConnection!.createOffer();
-    await _peerConnection!.setLocalDescription(offer);
+    final Map<String, dynamic> offerSdpConstraints = {
+      "mandatory": {
+        "OfferToReceiveAudio": false,
+        "OfferToReceiveVideo": false,
+      },
+      "optional": [],
+    };
+    final offer = await _peerConnection!.createOffer(offerSdpConstraints);
+    
+    String modifiedSdp = offer.sdp ?? "";
+    if (_localIp != "No conectado a Wi-Fi") {
+      modifiedSdp = modifiedSdp.replaceAll('127.0.0.1', _localIp);
+      modifiedSdp = modifiedSdp.replaceAll('0.0.0.0', _localIp);
+    }
+    
+    // Forzar un bitrate muy alto para video (15 Mbps)
+    final lines = modifiedSdp.split('\r\n');
+    for (int i = 0; i < lines.length; i++) {
+      if (lines[i].startsWith('m=video ')) {
+        lines.insert(i + 1, 'b=AS:15000');
+        break;
+      }
+    }
+    modifiedSdp = lines.join('\r\n');
+
+    await _peerConnection!.setLocalDescription(RTCSessionDescription(modifiedSdp, offer.type));
 
     _signalingServer!.sendMessageToAll({
       'type': 'offer',
       'offer': {
         'type': offer.type,
-        'sdp': offer.sdp
+        'sdp': modifiedSdp
       }
     });
 
@@ -250,7 +349,7 @@ class _CameraScreenState extends State<CameraScreen> {
     }
   }
 
-  void _stopWebRTCStream() {
+  void _stopStreaming() {
     _peerConnection?.close();
     _peerConnection = null;
     _cameraService.peerConnection = null;
@@ -322,11 +421,37 @@ class _CameraScreenState extends State<CameraScreen> {
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  const Text("Ajustes de Lente (WebRTC)", style: TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold)),
-                  const SizedBox(height: 20),
-                  
+                  const Text("CONFIGURACIÓN DE CÁMARA", style: TextStyle(color: Colors.greenAccent, fontSize: 16, fontWeight: FontWeight.bold)),
+                  const Divider(color: Colors.white24),
+                  const SizedBox(height: 10),
+
+                  // Toggle de Modo Wi-Fi / USB
                   Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
                     children: [
+                      const Text("Modo Conexión:", style: TextStyle(color: Colors.white, fontSize: 16)),
+                      ToggleButtons(
+                        isSelected: [!_cameraService.isUsbMode, _cameraService.isUsbMode],
+                        onPressed: (index) {
+                          _cameraService.setTransmissionMode(index == 1);
+                        },
+                        color: Colors.white54,
+                        selectedColor: Colors.white,
+                        fillColor: Colors.blueAccent.withOpacity(0.3),
+                        borderColor: Colors.white24,
+                        selectedBorderColor: Colors.blueAccent,
+                        borderRadius: BorderRadius.circular(8),
+                        children: const [
+                          Padding(padding: EdgeInsets.symmetric(horizontal: 12), child: Text("Wi-Fi (WebRTC)")),
+                          Padding(padding: EdgeInsets.symmetric(horizontal: 12), child: Text("USB (MJPEG)")),
+                        ],
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 20),
+
+                  // Lente
+                  Row(  children: [
                       const Icon(Icons.camera_alt, color: Colors.white),
                       const SizedBox(width: 10),
                       const Text("Lente:", style: TextStyle(color: Colors.white)),
@@ -436,7 +561,9 @@ class _CameraScreenState extends State<CameraScreen> {
       );
     }
 
-    if (_cameraService.errorMessage != null || _cameraService.localStream == null) {
+    if (_cameraService.errorMessage != null || 
+        (!_cameraService.isUsbMode && _cameraService.localStream == null) || 
+        (_cameraService.isUsbMode && _cameraService.usbCameraController == null)) {
       return Scaffold(
         body: Center(
           child: Padding(
@@ -452,7 +579,7 @@ class _CameraScreenState extends State<CameraScreen> {
                 const SizedBox(height: 30),
                 ElevatedButton(
                   onPressed: () {
-                    _cameraService.startCamera();
+                    _cameraService.setTransmissionMode(_cameraService.isUsbMode);
                   },
                   child: const Text("Reintentar"),
                 )
@@ -468,10 +595,12 @@ class _CameraScreenState extends State<CameraScreen> {
         fit: StackFit.expand,
         children: [
           Positioned.fill(
-            child: RTCVideoView(
-              _cameraService.localRenderer, 
-              objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitCover,
-            ),
+            child: _cameraService.isUsbMode 
+              ? cam.CameraPreview(_cameraService.usbCameraController!)
+              : RTCVideoView(
+                  _cameraService.localRenderer, 
+                  objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitCover,
+                ),
           ),
           
           SafeArea(
@@ -493,7 +622,13 @@ class _CameraScreenState extends State<CameraScreen> {
                               color: _connectedClientsCount > 0 ? Colors.green : Colors.black54
                             ),
                           ),
-                          _buildStatusChip(Icons.tv, _localIp),
+                          GestureDetector(
+                            onTap: () {
+                              ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Actualizando IP...')));
+                              _fetchLocalIp();
+                            },
+                            child: _buildStatusChip(Icons.refresh, _localIp),
+                          ),
                         ],
                       ),
                       const SizedBox(height: 10),
@@ -535,9 +670,9 @@ class _CameraScreenState extends State<CameraScreen> {
                         backgroundColor: _isStreaming ? Colors.green : Colors.redAccent,
                         onPressed: () {
                           if (_isStreaming) {
-                            _stopWebRTCStream();
+                            _stopStreaming();
                           } else {
-                            _startWebRTCStream();
+                            _startStreaming();
                           }
                         },
                         child: Icon(_isStreaming ? Icons.stop : Icons.live_tv, color: Colors.white),

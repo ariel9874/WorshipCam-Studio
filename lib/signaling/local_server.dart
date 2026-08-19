@@ -17,13 +17,19 @@ class LocalSignalingServer {
   Registration? _nsdRegistration;
   
   // Callbacks para comunicar con main.dart (WebRTC)
-  Function(String clientId, Map<String, dynamic> message)? onMessageReceived;
+  Function(String clientId, String clientIp, Map<String, dynamic> message)? onMessageReceived;
   Function(String clientId)? onClientConnected;
   Function(String clientId)? onClientDisconnected;
 
   // Callbacks para el Control Remoto
   Function(Map<String, dynamic> message)? onRemoteCommandReceived;
   Function(bool connected)? onRemoteControlStatusChanged;
+
+  void broadcastVideoFrame(Uint8List frame) {
+    for (var client in webrtcClients.values) {
+      client.sink.add(frame);
+    }
+  }
 
   Future<void> start() async {
     final router = Router();
@@ -34,29 +40,35 @@ class LocalSignalingServer {
     });
 
     // 2. Ruta WebSocket: Clientes de Video (OBS y Windows App)
-    router.get('/ws', webSocketHandler((webSocket, protocol) {
-      // Mutex: Desconectar clientes anteriores
-      final oldClients = webrtcClients.values.toList();
-      for (var client in oldClients) {
-        client.sink.close();
-      }
-      webrtcClients.clear();
+    router.get('/ws', (Request request) {
+      final info = request.context['shelf.io.connection_info'] as HttpConnectionInfo?;
+      final clientIp = info?.remoteAddress.address ?? '127.0.0.1';
 
-      final clientId = DateTime.now().millisecondsSinceEpoch.toString();
-      webrtcClients[clientId] = webSocket;
-      
-      debugPrint("Cliente WebRTC conectado: $clientId");
-      onClientConnected?.call(clientId);
+      final handler = webSocketHandler((webSocket, protocol) {
+        // Mutex: Desconectar clientes anteriores
+        final oldClients = webrtcClients.values.toList();
+        for (var client in oldClients) {
+          client.sink.close();
+        }
+        webrtcClients.clear();
 
-      webSocket.stream.listen((message) {
-        final data = jsonDecode(message);
-        onMessageReceived?.call(clientId, data);
-      }, onDone: () {
-        debugPrint("Cliente WebRTC desconectado: $clientId");
-        webrtcClients.remove(clientId);
-        onClientDisconnected?.call(clientId);
+        final clientId = DateTime.now().millisecondsSinceEpoch.toString();
+        webrtcClients[clientId] = webSocket;
+        
+        debugPrint("Cliente WebRTC conectado: $clientId (IP: $clientIp)");
+        onClientConnected?.call(clientId);
+
+        webSocket.stream.listen((message) {
+          final data = jsonDecode(message);
+          onMessageReceived?.call(clientId, clientIp, data);
+        }, onDone: () {
+          debugPrint("Cliente WebRTC desconectado: $clientId");
+          webrtcClients.remove(clientId);
+          onClientDisconnected?.call(clientId);
+        });
       });
-    }));
+      return handler(request);
+    });
 
     // 3. Ruta WebSocket para el Control Remoto (App de Windows)
     router.get('/control', webSocketHandler((webSocket, protocol) {
