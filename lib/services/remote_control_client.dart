@@ -3,7 +3,9 @@ import 'package:flutter/foundation.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
 class RemoteControlClient {
-  WebSocketChannel? _channel;
+  @visibleForTesting
+  WebSocketChannel? channel;
+  
   bool isConnected = false;
   
   final Function() onConnected;
@@ -23,7 +25,7 @@ class RemoteControlClient {
     
     final url = 'ws://$ipStr:8080/control';
     try {
-      _channel = WebSocketChannel.connect(Uri.parse(url));
+      channel = WebSocketChannel.connect(Uri.parse(url));
       
       // Enviar un mensaje de ping o identificación inicial
       sendCommand('ping', 'windows_client');
@@ -31,7 +33,7 @@ class RemoteControlClient {
       isConnected = true;
       onConnected();
 
-      _channel!.stream.listen(
+      channel!.stream.listen(
         (message) {
           debugPrint('Mensaje recibido del celular: $message');
         },
@@ -53,16 +55,17 @@ class RemoteControlClient {
   }
 
   void disconnect() {
-    _channel?.sink.close();
+    channel?.sink.close();
     isConnected = false;
     onDisconnected();
   }
 
   void sendCommand(String type, dynamic value) {
-    if (_channel != null && isConnected) {
+    if (channel != null && isConnected) {
       final msg = jsonEncode({'type': type, 'value': value});
-      _channel!.sink.add(msg);
+      channel!.sink.add(msg);
       debugPrint('Enviando comando: $msg');
     }
   }
 }
+

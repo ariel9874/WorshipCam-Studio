@@ -62,14 +62,7 @@ class WebRTCService {
     }
     
     // Forzar un bitrate muy alto para video (15 Mbps)
-    final lines = modifiedSdp.split('\r\n');
-    for (int i = 0; i < lines.length; i++) {
-      if (lines[i].startsWith('m=video ')) {
-        lines.insert(i + 1, 'b=AS:15000');
-        break;
-      }
-    }
-    modifiedSdp = lines.join('\r\n');
+    modifiedSdp = mungeSdp(modifiedSdp);
 
     await peerConnection!.setLocalDescription(RTCSessionDescription(modifiedSdp, offer.type));
 
@@ -80,6 +73,18 @@ class WebRTCService {
         'sdp': modifiedSdp
       }
     });
+  }
+
+  @visibleForTesting
+  static String mungeSdp(String sdp) {
+    final lines = sdp.split('\r\n');
+    for (int i = 0; i < lines.length; i++) {
+      if (lines[i].startsWith('m=video ')) {
+        lines.insert(i + 1, 'b=AS:15000');
+        break;
+      }
+    }
+    return lines.join('\r\n');
   }
 
   Future<void> handleAnswer(Map<String, dynamic> answerMap) async {
