@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
@@ -7,6 +8,7 @@ import '../../services/adb_service.dart';
 import '../../services/discovery_service.dart';
 import '../../services/remote_control_client.dart';
 import '../../services/serial_service.dart';
+import 'camera_node.dart';
 
 class RemoteControlScreen extends StatefulWidget {
   const RemoteControlScreen({Key? key}) : super(key: key);
@@ -17,36 +19,34 @@ class RemoteControlScreen extends StatefulWidget {
 
 class _RemoteControlScreenState extends State<RemoteControlScreen> {
   final TextEditingController _ipController = TextEditingController(text: '127.0.0.1');
-  RemoteControlClient? _client;
-  bool _isConnected = false;
+  
+  // Multiview State
+  final List<CameraNode> _cameras = [];
+  CameraNode? _activeCamera;
+
   bool _isTunnelActive = false;
   bool _isDiscovering = false;
 
   // Serial / ESP32
   final _serialService = SerialService();
+  StreamSubscription<String>? _serialSubscription;
   bool _isSerialConnected = false;
   String? _selectedComPort;
-
-  // WebRTC Monitor
-  final RTCVideoRenderer _remoteRenderer = RTCVideoRenderer();
-  RTCPeerConnection? _peerConnection;
-  WebSocketChannel? _webrtcChannel;
-  bool _isMonitoring = false;
 
   @override
   void initState() {
     super.initState();
-    _remoteRenderer.initialize();
-    _client = RemoteControlClient(
-      onConnected: () => setState(() => _isConnected = true),
-      onDisconnected: () => setState(() => _isConnected = false),
-      onError: (err) {
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Error: $err'), backgroundColor: Colors.red));
-        }
-      }
-    );
     _setupTunnel();
+    
+    // Escuchar mensajes provenientes del ESP32 Maestro (Ej: Botón del Joystick)
+    _serialSubscription = _serialService.onMessage.listen((msg) {
+      if (msg == "JOYSTICK:CLICK") {
+        _activeCamera?.client?.sendCommand('toggle_flash', null);
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text("⚡ Flash / Foco alternado desde el Joystick")),
+        );
+      }
+    });
   }
 
   Future<void> _setupTunnel() async {
@@ -64,37 +64,62 @@ class _RemoteControlScreenState extends State<RemoteControlScreen> {
       setState(() => _isDiscovering = false);
       if (ip != null) {
         _ipController.text = ip;
-        _connect();
+        _addCamera(ip);
       } else {
         ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('No se encontraron celulares en la red.')));
       }
     }
   }
 
-  void _connect() {
-    if (_ipController.text.isNotEmpty) {
-      _client?.connect(_ipController.text);
-      if (!_isMonitoring) {
-        _startVideoMonitor();
+  void _addCamera(String ip) async {
+    // Evitar duplicados
+    if (_cameras.any((c) => c.ip == ip)) return;
+
+    final node = CameraNode(ip: ip);
+    await node.initialize();
+    
+    node.client = RemoteControlClient(
+      onConnected: () {
+        if (mounted) setState(() => node.isConnected = true);
+      },
+      onDisconnected: () {
+        if (mounted) setState(() => node.isConnected = false);
+      },
+      onError: (err) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Error en $ip: $err'), backgroundColor: Colors.red));
+        }
       }
-    }
+    );
+
+    setState(() {
+      _cameras.add(node);
+      if (_activeCamera == null) _activeCamera = node;
+    });
+
+    node.client!.connect(ip);
+    _startVideoMonitor(node);
   }
 
-  void _disconnect() {
-    _client?.disconnect();
-    _stopVideoMonitor();
+  void _removeCamera(CameraNode node) {
+    node.dispose();
+    setState(() {
+      _cameras.remove(node);
+      if (_activeCamera == node) {
+        _activeCamera = _cameras.isNotEmpty ? _cameras.first : null;
+      }
+    });
   }
 
-  Future<void> _startVideoMonitor() async {
-    final url = 'ws://${_ipController.text}:8080/ws';
-    _webrtcChannel = WebSocketChannel.connect(Uri.parse(url));
+  Future<void> _startVideoMonitor(CameraNode node) async {
+    final url = 'ws://${node.ip}:8080/ws';
+    node.webrtcChannel = WebSocketChannel.connect(Uri.parse(url));
     
     final configuration = {'iceServers': []};
+    node.peerConnection = await createPeerConnection(configuration);
     
-    _peerConnection = await createPeerConnection(configuration);
-    
-    _peerConnection!.onIceCandidate = (candidate) {
-      _webrtcChannel!.sink.add(jsonEncode({
+    node.peerConnection!.onIceCandidate = (candidate) {
+      node.webrtcChannel!.sink.add(jsonEncode({
         'type': 'candidate',
         'candidate': {
           'candidate': candidate.candidate,
@@ -104,24 +129,24 @@ class _RemoteControlScreenState extends State<RemoteControlScreen> {
       }));
     };
     
-    _peerConnection!.onTrack = (event) {
+    node.peerConnection!.onTrack = (event) {
       if (event.track.kind == 'video') {
-        _remoteRenderer.srcObject = event.streams[0];
-        setState(() {});
+        node.renderer.srcObject = event.streams[0];
+        if (mounted) setState(() {});
       }
     };
     
-    _webrtcChannel!.stream.listen((message) async {
+    node.webrtcChannel!.stream.listen((message) async {
       final data = jsonDecode(message);
       final type = data['type'];
       
       if (type == 'offer') {
         final offer = RTCSessionDescription(data['offer']['sdp'], data['offer']['type']);
-        await _peerConnection!.setRemoteDescription(offer);
-        final answer = await _peerConnection!.createAnswer();
-        await _peerConnection!.setLocalDescription(answer);
+        await node.peerConnection!.setRemoteDescription(offer);
+        final answer = await node.peerConnection!.createAnswer();
+        await node.peerConnection!.setLocalDescription(answer);
         
-        _webrtcChannel!.sink.add(jsonEncode({
+        node.webrtcChannel!.sink.add(jsonEncode({
           'type': 'answer',
           'answer': {
             'type': answer.type,
@@ -134,32 +159,23 @@ class _RemoteControlScreenState extends State<RemoteControlScreen> {
           data['candidate']['sdpMid'],
           data['candidate']['sdpMLineIndex'],
         );
-        await _peerConnection!.addCandidate(candidate);
+        await node.peerConnection!.addCandidate(candidate);
       }
     }, onDone: () {
-      _stopVideoMonitor();
+      if (mounted) setState(() => node.isMonitoring = false);
     });
     
-    setState(() {
-      _isMonitoring = true;
-    });
-  }
-
-  void _stopVideoMonitor() {
-    _webrtcChannel?.sink.close();
-    _peerConnection?.close();
-    _remoteRenderer.srcObject = null;
-    setState(() {
-      _isMonitoring = false;
-    });
+    if (mounted) setState(() => node.isMonitoring = true);
   }
 
   @override
   void dispose() {
-    _client?.disconnect();
-    _webrtcChannel?.sink.close();
-    _peerConnection?.close();
-    _remoteRenderer.dispose();
+    _serialSubscription?.cancel();
+    _serialService.disconnect();
+    
+    for (var node in _cameras) {
+      node.dispose();
+    }
     _ipController.dispose();
     
     if (_isTunnelActive) {
@@ -170,10 +186,12 @@ class _RemoteControlScreenState extends State<RemoteControlScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final hasActiveCamera = _activeCamera != null && _activeCamera!.isConnected;
+    
     return Scaffold(
-      backgroundColor: const Color(0xFF1A1A1A), // Dark modern theme
+      backgroundColor: const Color(0xFF1A1A1A),
       appBar: AppBar(
-        title: const Text('WorshipCam Studio', style: TextStyle(fontWeight: FontWeight.w600, letterSpacing: 1.2)),
+        title: const Text('WorshipCam Studio Multiview', style: TextStyle(fontWeight: FontWeight.w600, letterSpacing: 1.2)),
         backgroundColor: const Color(0xFF121212),
         elevation: 0,
         actions: [
@@ -181,14 +199,14 @@ class _RemoteControlScreenState extends State<RemoteControlScreen> {
             margin: const EdgeInsets.all(12),
             padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
             decoration: BoxDecoration(
-              color: _isConnected ? Colors.green.withOpacity(0.2) : Colors.red.withOpacity(0.2),
-              border: Border.all(color: _isConnected ? Colors.green : Colors.redAccent),
+              color: _isSerialConnected ? Colors.green.withOpacity(0.2) : Colors.orange.withOpacity(0.2),
+              border: Border.all(color: _isSerialConnected ? Colors.green : Colors.orangeAccent),
               borderRadius: BorderRadius.circular(20),
             ),
             child: Center(
               child: Text(
-                _isConnected ? "CONECTADO" : "DESCONECTADO",
-                style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12, color: _isConnected ? Colors.greenAccent : Colors.redAccent),
+                _isSerialConnected ? "PTZ EN LÍNEA" : "PTZ DESCONECTADO",
+                style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12, color: _isSerialConnected ? Colors.greenAccent : Colors.orangeAccent),
               ),
             ),
           )
@@ -196,67 +214,31 @@ class _RemoteControlScreenState extends State<RemoteControlScreen> {
       ),
       body: Row(
         children: [
-          // Área de Video
+          // Área de Video (Grid)
           Expanded(
             flex: 3,
-            child: Container(
-              margin: const EdgeInsets.all(24),
-              decoration: BoxDecoration(
-                color: Colors.black,
-                borderRadius: BorderRadius.circular(16),
-                border: Border.all(color: const Color(0xFF333333), width: 2),
-                boxShadow: [
-                  BoxShadow(color: Colors.black.withOpacity(0.4), blurRadius: 15, offset: const Offset(0, 10))
-                ]
-              ),
-              child: ClipRRect(
-                borderRadius: BorderRadius.circular(14),
-                child: Stack(
-                  fit: StackFit.expand,
-                  children: [
-                    if (_isMonitoring)
-                      RTCVideoView(
-                        _remoteRenderer,
-                        objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitContain,
-                      )
-                    else
-                      const Center(
-                        child: Column(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            Icon(Icons.videocam_off_outlined, color: Colors.white24, size: 80),
-                            SizedBox(height: 16),
-                            Text("Esperando conexión de cámara...", style: TextStyle(color: Colors.white54, fontSize: 16)),
-                          ],
-                        ),
-                      ),
-                  ],
-                ),
-              ),
-            ),
-          ),
-
-          // Panel de Control
-          Container(
-            width: 380,
-            decoration: const BoxDecoration(
-              color: Color(0xFF222222),
-              border: Border(left: BorderSide(color: Color(0xFF333333))),
-            ),
-              child: ListView(
-                padding: const EdgeInsets.all(20),
-                children: [
-                  const Text("CONEXIÓN CÁMARA", style: TextStyle(color: Colors.greenAccent, fontWeight: FontWeight.bold)),
-                  const SizedBox(height: 10),
-                  Row(
+            child: Column(
+              children: [
+                // Top Bar for Adding Cameras
+                Container(
+                  padding: const EdgeInsets.all(16),
+                  color: const Color(0xFF222222),
+                  child: Row(
                     children: [
-                      Expanded(
+                      const Icon(Icons.videocam, color: Colors.white70),
+                      const SizedBox(width: 10),
+                      const Text("Cámaras Conectadas", style: TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold)),
+                      const Spacer(),
+                      SizedBox(
+                        width: 200,
+                        height: 40,
                         child: TextField(
                           controller: _ipController,
-                          style: const TextStyle(color: Colors.white),
+                          style: const TextStyle(color: Colors.white, fontSize: 14),
                           decoration: InputDecoration(
-                            labelText: 'IP del Celular',
-                            labelStyle: const TextStyle(color: Colors.white54),
+                            hintText: 'Ej. 192.168.1.10',
+                            hintStyle: const TextStyle(color: Colors.white38),
+                            contentPadding: const EdgeInsets.symmetric(horizontal: 12),
                             filled: true,
                             fillColor: Colors.black54,
                             border: OutlineInputBorder(borderRadius: BorderRadius.circular(8)),
@@ -264,166 +246,268 @@ class _RemoteControlScreenState extends State<RemoteControlScreen> {
                         ),
                       ),
                       const SizedBox(width: 10),
+                      ElevatedButton.icon(
+                        icon: const Icon(Icons.add, size: 18),
+                        label: const Text("Añadir IP"),
+                        style: ElevatedButton.styleFrom(backgroundColor: Colors.blueAccent),
+                        onPressed: () {
+                          if (_ipController.text.isNotEmpty) {
+                            _addCamera(_ipController.text);
+                          }
+                        },
+                      ),
+                      const SizedBox(width: 10),
                       IconButton(
                         onPressed: _isDiscovering ? null : _discoverDevice,
                         icon: _isDiscovering 
-                            ? const SizedBox(width: 24, height: 24, child: CircularProgressIndicator(strokeWidth: 2))
+                            ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2))
                             : const Icon(Icons.search, color: Colors.blueAccent),
                         tooltip: "Buscar en Wi-Fi",
                       )
                     ],
                   ),
-                  const SizedBox(height: 10),
-                  ElevatedButton(
-                    style: ElevatedButton.styleFrom(
-                      backgroundColor: _isConnected ? Colors.redAccent : Colors.blueAccent,
-                      padding: const EdgeInsets.symmetric(vertical: 15),
-                    ),
-                    onPressed: _isConnected ? _disconnect : _connect,
-                    child: Text(_isConnected ? "DESCONECTAR" : "CONECTAR", style: const TextStyle(color: Colors.white)),
-                  ),
-                  
-                  const SizedBox(height: 30),
-                  const Divider(color: Colors.white24),
-                  const SizedBox(height: 20),
-
-                  const Text("HARDWARE PTZ (ESP32 MAESTRO)", style: TextStyle(color: Colors.orangeAccent, fontWeight: FontWeight.bold)),
-                  const SizedBox(height: 10),
-                  Row(
-                    children: [
-                      Expanded(
-                        child: DropdownButton<String>(
-                          dropdownColor: Colors.black87,
-                          isExpanded: true,
-                          style: const TextStyle(color: Colors.white),
-                          hint: const Text("Puerto COM", style: TextStyle(color: Colors.white54)),
-                          value: _selectedComPort,
-                          items: _serialService.getAvailablePorts().map((port) {
-                            return DropdownMenuItem(value: port, child: Text(port));
-                          }).toList(),
-                          onChanged: _isSerialConnected ? null : (val) => setState(() => _selectedComPort = val),
+                ),
+                
+                // Grid View
+                Expanded(
+                  child: _cameras.isEmpty 
+                    ? const Center(
+                        child: Column(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Icon(Icons.grid_view, color: Colors.white24, size: 80),
+                            SizedBox(height: 16),
+                            Text("No hay cámaras. Añade una IP o busca en la red.", style: TextStyle(color: Colors.white54, fontSize: 16)),
+                          ],
                         ),
+                      )
+                    : GridView.builder(
+                        padding: const EdgeInsets.all(16),
+                        gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+                          crossAxisCount: _cameras.length <= 2 ? 1 : 2,
+                          childAspectRatio: 16 / 9,
+                          crossAxisSpacing: 16,
+                          mainAxisSpacing: 16,
+                        ),
+                        itemCount: _cameras.length,
+                        itemBuilder: (context, index) {
+                          final node = _cameras[index];
+                          final isActive = _activeCamera == node;
+                          
+                          return GestureDetector(
+                            onTap: () => setState(() => _activeCamera = node),
+                            child: Container(
+                              decoration: BoxDecoration(
+                                color: Colors.black,
+                                borderRadius: BorderRadius.circular(12),
+                                border: Border.all(
+                                  color: isActive ? Colors.orangeAccent : const Color(0xFF333333), 
+                                  width: isActive ? 3 : 2
+                                ),
+                                boxShadow: isActive ? [BoxShadow(color: Colors.orange.withOpacity(0.3), blurRadius: 10)] : null,
+                              ),
+                              child: Stack(
+                                fit: StackFit.expand,
+                                children: [
+                                  ClipRRect(
+                                    borderRadius: BorderRadius.circular(9),
+                                    child: node.isMonitoring
+                                        ? RTCVideoView(node.renderer, objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitContain)
+                                        : const Center(child: Icon(Icons.videocam_off, color: Colors.white24, size: 50)),
+                                  ),
+                                  // Overlay
+                                  Positioned(
+                                    top: 8, left: 8,
+                                    child: Container(
+                                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                                      decoration: BoxDecoration(color: Colors.black87, borderRadius: BorderRadius.circular(4)),
+                                      child: Row(
+                                        children: [
+                                          Icon(Icons.circle, size: 10, color: node.isConnected ? Colors.greenAccent : Colors.redAccent),
+                                          const SizedBox(width: 6),
+                                          Text("CAM ${index + 1} (${node.ip})", style: const TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.bold)),
+                                        ],
+                                      ),
+                                    ),
+                                  ),
+                                  Positioned(
+                                    top: 8, right: 8,
+                                    child: IconButton(
+                                      icon: const Icon(Icons.close, color: Colors.white70),
+                                      onPressed: () => _removeCamera(node),
+                                    ),
+                                  )
+                                ],
+                              ),
+                            ),
+                          );
+                        },
                       ),
+                ),
+              ],
+            ),
+          ),
+
+          // Panel de Control (Afecta a _activeCamera)
+          Container(
+            width: 380,
+            decoration: const BoxDecoration(
+              color: Color(0xFF222222),
+              border: Border(left: BorderSide(color: Color(0xFF333333))),
+            ),
+            child: ListView(
+              padding: const EdgeInsets.all(20),
+              children: [
+                Container(
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                    color: _activeCamera != null ? Colors.orange.withOpacity(0.1) : Colors.white10,
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(color: _activeCamera != null ? Colors.orangeAccent.withOpacity(0.5) : Colors.transparent),
+                  ),
+                  child: Row(
+                    children: [
+                      const Icon(Icons.tune, color: Colors.white70),
                       const SizedBox(width: 10),
-                      IconButton(
-                        onPressed: () => setState(() {}),
-                        icon: const Icon(Icons.refresh, color: Colors.white54),
-                        tooltip: "Escanear puertos",
+                      Expanded(
+                        child: Text(
+                          _activeCamera != null ? "Controlando: ${_activeCamera!.ip}" : "Ninguna cámara seleccionada",
+                          style: TextStyle(color: _activeCamera != null ? Colors.orangeAccent : Colors.white54, fontWeight: FontWeight.bold),
+                        ),
                       )
                     ],
                   ),
-                  const SizedBox(height: 10),
-                  ElevatedButton(
-                    style: ElevatedButton.styleFrom(
-                      backgroundColor: _isSerialConnected ? Colors.redAccent : Colors.orangeAccent,
-                      padding: const EdgeInsets.symmetric(vertical: 15),
-                    ),
-                    onPressed: () {
-                      if (_isSerialConnected) {
-                        _serialService.disconnect();
-                        setState(() => _isSerialConnected = false);
-                      } else if (_selectedComPort != null) {
-                        final success = _serialService.connect(_selectedComPort!);
-                        setState(() => _isSerialConnected = success);
-                      }
-                    },
-                    child: Text(_isSerialConnected ? "DESCONECTAR ESP32" : "CONECTAR ESP32", style: const TextStyle(color: Colors.white)),
-                  ),
+                ),
+                
+                const SizedBox(height: 30),
+                const Divider(color: Colors.white24),
+                const SizedBox(height: 20),
 
-                  if (_isSerialConnected) ...[
-                    const SizedBox(height: 20),
-                    Center(
-                      child: Column(
-                        children: [
-                          _buildPtzButton(
-                            icon: Icons.keyboard_arrow_up,
-                            command: "TILT",
-                            action: "UP",
-                          ),
-                          Row(
-                            mainAxisAlignment: MainAxisAlignment.center,
-                            children: [
-                              _buildPtzButton(
-                                icon: Icons.keyboard_arrow_left,
-                                command: "PAN",
-                                action: "LEFT",
-                              ),
-                              const SizedBox(width: 20),
-                              IconButton(
-                                icon: const Icon(Icons.center_focus_strong, size: 30, color: Colors.orangeAccent),
-                                onPressed: () => _serialService.sendCommand("PTZ:CENTER"),
-                                tooltip: "Ir al Centro (Homing)",
-                              ),
-                              const SizedBox(width: 20),
-                              _buildPtzButton(
-                                icon: Icons.keyboard_arrow_right,
-                                command: "PAN",
-                                action: "RIGHT",
-                              ),
-                            ],
-                          ),
-                          _buildPtzButton(
-                            icon: Icons.keyboard_arrow_down,
-                            command: "TILT",
-                            action: "DOWN",
-                          ),
-                        ],
+                const Text("HARDWARE PTZ (ESP32 MAESTRO)", style: TextStyle(color: Colors.orangeAccent, fontWeight: FontWeight.bold)),
+                const SizedBox(height: 10),
+                Row(
+                  children: [
+                    Expanded(
+                      child: DropdownButton<String>(
+                        dropdownColor: Colors.black87,
+                        isExpanded: true,
+                        style: const TextStyle(color: Colors.white),
+                        hint: const Text("Puerto COM", style: TextStyle(color: Colors.white54)),
+                        value: _selectedComPort,
+                        items: _serialService.getAvailablePorts().map((port) {
+                          return DropdownMenuItem(value: port, child: Text(port));
+                        }).toList(),
+                        onChanged: _isSerialConnected ? null : (val) => setState(() => _selectedComPort = val),
                       ),
                     ),
+                    const SizedBox(width: 10),
+                    IconButton(
+                      onPressed: () => setState(() {}),
+                      icon: const Icon(Icons.refresh, color: Colors.white54),
+                      tooltip: "Escanear puertos",
+                    )
                   ],
+                ),
+                const SizedBox(height: 10),
+                ElevatedButton(
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: _isSerialConnected ? Colors.redAccent : Colors.orangeAccent,
+                    padding: const EdgeInsets.symmetric(vertical: 15),
+                  ),
+                  onPressed: () {
+                    if (_isSerialConnected) {
+                      _serialService.disconnect();
+                      setState(() => _isSerialConnected = false);
+                    } else if (_selectedComPort != null) {
+                      final success = _serialService.connect(_selectedComPort!);
+                      setState(() => _isSerialConnected = success);
+                    }
+                  },
+                  child: Text(_isSerialConnected ? "DESCONECTAR ESP32" : "CONECTAR ESP32", style: const TextStyle(color: Colors.white)),
+                ),
 
-                  const SizedBox(height: 30),
-                  const Divider(color: Colors.white24),
+                if (_isSerialConnected) ...[
                   const SizedBox(height: 20),
-
-                  const Text("CÁMARA", style: TextStyle(color: Colors.greenAccent, fontWeight: FontWeight.bold)),
-                  const SizedBox(height: 10),
-                  
-                  _buildControlCard(
-                    title: "Cambiar Lente",
-                    icon: Icons.cameraswitch,
-                    onTap: () => _client?.sendCommand('switch_lens', null),
+                  Center(
+                    child: Column(
+                      children: [
+                        _buildPtzButton(icon: Icons.keyboard_arrow_up, command: "TILT", action: "UP"),
+                        Row(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            _buildPtzButton(icon: Icons.keyboard_arrow_left, command: "PAN", action: "LEFT"),
+                            const SizedBox(width: 20),
+                            IconButton(
+                              icon: const Icon(Icons.center_focus_strong, size: 30, color: Colors.orangeAccent),
+                              onPressed: () => _serialService.sendCommand("PTZ:CENTER"),
+                              tooltip: "Ir al Centro (Homing)",
+                            ),
+                            const SizedBox(width: 20),
+                            _buildPtzButton(icon: Icons.keyboard_arrow_right, command: "PAN", action: "RIGHT"),
+                          ],
+                        ),
+                        _buildPtzButton(icon: Icons.keyboard_arrow_down, command: "TILT", action: "DOWN"),
+                      ],
+                    ),
                   ),
-                  
-                  _buildControlCard(
-                    title: "Activar/Desactivar Flash",
-                    icon: Icons.flash_on,
-                    onTap: () => _client?.sendCommand('toggle_flash', null),
-                  ),
-
-                  const SizedBox(height: 20),
-                  const Text("CALIDAD", style: TextStyle(color: Colors.greenAccent, fontWeight: FontWeight.bold)),
-                  const SizedBox(height: 10),
-
-                  _buildSegmentedControl(
-                    title: "Resolución",
-                    items: const ['max', 'high', 'medium'],
-                    labels: const ['4K/Max', '1080p', '720p'],
-                    selectedValue: _selectedRes,
-                    onChanged: (val) {
-                      setState(() => _selectedRes = val);
-                      _client?.sendCommand('set_resolution', val);
-                    },
-                  ),
-                  
-                  const SizedBox(height: 20),
-                  
-                  _buildSegmentedControl(
-                    title: "Velocidad (FPS)",
-                    items: const ['24', '30', '60'],
-                    labels: const ['24fps', '30fps', '60fps'],
-                    selectedValue: _selectedFps,
-                    onChanged: (val) {
-                      setState(() => _selectedFps = val);
-                      _client?.sendCommand('set_fps', int.parse(val));
-                    },
-                  ),
-                  
                 ],
-              ),
-            )
-          ],
-        ),
+
+                const SizedBox(height: 30),
+                const Divider(color: Colors.white24),
+                const SizedBox(height: 20),
+
+                const Text("CÁMARA", style: TextStyle(color: Colors.greenAccent, fontWeight: FontWeight.bold)),
+                const SizedBox(height: 10),
+                
+                _buildControlCard(
+                  title: "Cambiar Lente",
+                  icon: Icons.cameraswitch,
+                  onTap: () => _activeCamera?.client?.sendCommand('switch_lens', null),
+                  enabled: hasActiveCamera,
+                ),
+                
+                _buildControlCard(
+                  title: "Activar/Desactivar Flash",
+                  icon: Icons.flash_on,
+                  onTap: () => _activeCamera?.client?.sendCommand('toggle_flash', null),
+                  enabled: hasActiveCamera,
+                ),
+
+                const SizedBox(height: 20),
+                const Text("CALIDAD", style: TextStyle(color: Colors.greenAccent, fontWeight: FontWeight.bold)),
+                const SizedBox(height: 10),
+
+                _buildSegmentedControl(
+                  title: "Resolución",
+                  items: const ['max', 'high', 'medium'],
+                  labels: const ['4K/Max', '1080p', '720p'],
+                  selectedValue: _selectedRes,
+                  enabled: hasActiveCamera,
+                  onChanged: (val) {
+                    setState(() => _selectedRes = val);
+                    _activeCamera?.client?.sendCommand('set_resolution', val);
+                  },
+                ),
+                
+                const SizedBox(height: 20),
+                
+                _buildSegmentedControl(
+                  title: "Velocidad (FPS)",
+                  items: const ['24', '30', '60'],
+                  labels: const ['24fps', '30fps', '60fps'],
+                  selectedValue: _selectedFps,
+                  enabled: hasActiveCamera,
+                  onChanged: (val) {
+                    setState(() => _selectedFps = val);
+                    _activeCamera?.client?.sendCommand('set_fps', int.parse(val));
+                  },
+                ),
+                
+              ],
+            ),
+          )
+        ],
+      ),
     );
   }
 
@@ -446,9 +530,9 @@ class _RemoteControlScreenState extends State<RemoteControlScreen> {
     );
   }
 
-  Widget _buildControlCard({required String title, required IconData icon, required VoidCallback onTap}) {
+  Widget _buildControlCard({required String title, required IconData icon, required VoidCallback onTap, required bool enabled}) {
     return InkWell(
-      onTap: _isConnected ? onTap : null,
+      onTap: enabled ? onTap : null,
       borderRadius: BorderRadius.circular(10),
       child: Container(
         margin: const EdgeInsets.only(bottom: 10),
@@ -460,10 +544,10 @@ class _RemoteControlScreenState extends State<RemoteControlScreen> {
         ),
         child: Row(
           children: [
-            Icon(icon, color: _isConnected ? Colors.white : Colors.white38, size: 20),
+            Icon(icon, color: enabled ? Colors.white : Colors.white38, size: 20),
             const SizedBox(width: 16),
-            Expanded(child: Text(title, style: TextStyle(color: _isConnected ? Colors.white : Colors.white38, fontSize: 14, fontWeight: FontWeight.w500))),
-            Icon(Icons.chevron_right, color: _isConnected ? Colors.white54 : Colors.white24, size: 20),
+            Expanded(child: Text(title, style: TextStyle(color: enabled ? Colors.white : Colors.white38, fontSize: 14, fontWeight: FontWeight.w500))),
+            Icon(Icons.chevron_right, color: enabled ? Colors.white54 : Colors.white24, size: 20),
           ],
         ),
       ),
@@ -475,6 +559,7 @@ class _RemoteControlScreenState extends State<RemoteControlScreen> {
     required List<String> items, 
     required List<String> labels, 
     required String selectedValue,
+    required bool enabled,
     required Function(String) onChanged
   }) {
     return Column(
@@ -494,17 +579,17 @@ class _RemoteControlScreenState extends State<RemoteControlScreen> {
               final isSelected = items[index] == selectedValue;
               return Expanded(
                 child: GestureDetector(
-                  onTap: _isConnected ? () => onChanged(items[index]) : null,
+                  onTap: enabled ? () => onChanged(items[index]) : null,
                   child: Container(
                     decoration: BoxDecoration(
-                      color: isSelected ? Colors.blueAccent : Colors.transparent,
+                      color: isSelected && enabled ? Colors.blueAccent : Colors.transparent,
                       borderRadius: BorderRadius.circular(7),
                     ),
                     child: Center(
                       child: Text(
                         labels[index], 
                         style: TextStyle(
-                          color: _isConnected ? (isSelected ? Colors.white : Colors.white54) : Colors.white24,
+                          color: enabled ? (isSelected ? Colors.white : Colors.white54) : Colors.white24,
                           fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
                           fontSize: 13
                         )

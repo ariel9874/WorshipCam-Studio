@@ -1,10 +1,16 @@
+import 'dart:async';
 import 'dart:typed_data';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_libserialport/flutter_libserialport.dart';
 
 class SerialService {
   SerialPort? _port;
+  SerialPortReader? _reader;
   bool isConnected = false;
+  
+  // Stream de eventos desde el ESP32 hacia Flutter
+  final _messageController = StreamController<String>.broadcast();
+  Stream<String> get onMessage => _messageController.stream;
 
   /// Obtiene la lista de puertos COM disponibles
   List<String> getAvailablePorts() {
@@ -25,6 +31,15 @@ class SerialService {
       config.baudRate = baudRate;
       _port!.config = config;
 
+      // Iniciar el Lector (Reader)
+      _reader = SerialPortReader(_port!);
+      _reader!.stream.listen((data) {
+        String message = String.fromCharCodes(data).trim();
+        if (message.isNotEmpty) {
+          _messageController.add(message);
+        }
+      });
+
       isConnected = true;
       debugPrint("Conectado exitosamente al Maestro ESP32 en $portName");
       return true;
@@ -36,6 +51,9 @@ class SerialService {
 
   /// Desconecta el puerto
   void disconnect() {
+    _reader?.close();
+    _reader = null;
+    
     if (_port != null && _port!.isOpen) {
       _port!.close();
       _port!.dispose();
