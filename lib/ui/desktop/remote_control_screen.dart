@@ -439,7 +439,12 @@ class _RemoteControlScreenState extends State<RemoteControlScreen> {
                             const SizedBox(width: 20),
                             IconButton(
                               icon: const Icon(Icons.center_focus_strong, size: 30, color: Colors.orangeAccent),
-                              onPressed: () => _serialService.sendCommand("PTZ:CENTER"),
+                              onPressed: () {
+                                if (_activeCamera != null) {
+                                  int camId = _cameras.indexOf(_activeCamera!) + 1;
+                                  _serialService.sendCommand("CAM$camId:PTZ:CENTER");
+                                }
+                              },
                               tooltip: "Ir al Centro (Homing)",
                             ),
                             const SizedBox(width: 20),
@@ -516,9 +521,24 @@ class _RemoteControlScreenState extends State<RemoteControlScreen> {
 
   Widget _buildPtzButton({required IconData icon, required String command, required String action}) {
     return GestureDetector(
-      onTapDown: (_) => _serialService.sendCommand("$command:$action"),
-      onTapUp: (_) => _serialService.sendCommand("$command:STOP"),
-      onTapCancel: () => _serialService.sendCommand("$command:STOP"),
+      onTapDown: (_) {
+        if (_activeCamera != null) {
+          int camId = _cameras.indexOf(_activeCamera!) + 1;
+          _serialService.sendCommand("CAM$camId:$command:$action");
+        }
+      },
+      onTapUp: (_) {
+        if (_activeCamera != null) {
+          int camId = _cameras.indexOf(_activeCamera!) + 1;
+          _serialService.sendCommand("CAM$camId:$command:STOP");
+        }
+      },
+      onTapCancel: () {
+        if (_activeCamera != null) {
+          int camId = _cameras.indexOf(_activeCamera!) + 1;
+          _serialService.sendCommand("CAM$camId:$command:STOP");
+        }
+      },
       child: Container(
         padding: const EdgeInsets.all(12),
         decoration: BoxDecoration(
