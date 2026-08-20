@@ -28,8 +28,3 @@ class CamoCloneApp extends StatelessWidget {
     );
   }
 }
-    ],
-      ),
-    );
-  }
-}

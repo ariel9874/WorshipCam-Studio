@@ -240,7 +240,7 @@ class _CameraScreenState extends State<CameraScreen> {
                       const Text("Lente:", style: TextStyle(color: Colors.white)),
                       const SizedBox(width: 10),
                       Expanded(
-                        child: DropdownButton<cam.MediaDeviceInfo>(
+                        child: DropdownButton<MediaDeviceInfo>(
                           dropdownColor: Colors.black87,
                           isExpanded: true,
                           value: _cameraService.selectedCamera,

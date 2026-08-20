@@ -6,6 +6,7 @@ import 'package:web_socket_channel/web_socket_channel.dart';
 import '../../services/adb_service.dart';
 import '../../services/discovery_service.dart';
 import '../../services/remote_control_client.dart';
+import '../../services/serial_service.dart';
 
 class RemoteControlScreen extends StatefulWidget {
   const RemoteControlScreen({Key? key}) : super(key: key);
@@ -20,6 +21,11 @@ class _RemoteControlScreenState extends State<RemoteControlScreen> {
   bool _isConnected = false;
   bool _isTunnelActive = false;
   bool _isDiscovering = false;
+
+  // Serial / ESP32
+  final _serialService = SerialService();
+  bool _isSerialConnected = false;
+  String? _selectedComPort;
 
   // WebRTC Monitor
   final RTCVideoRenderer _remoteRenderer = RTCVideoRenderer();
@@ -240,7 +246,7 @@ class _RemoteControlScreenState extends State<RemoteControlScreen> {
               child: ListView(
                 padding: const EdgeInsets.all(20),
                 children: [
-                  const Text("CONEXIÓN", style: TextStyle(color: Colors.greenAccent, fontWeight: FontWeight.bold)),
+                  const Text("CONEXIÓN CÁMARA", style: TextStyle(color: Colors.greenAccent, fontWeight: FontWeight.bold)),
                   const SizedBox(height: 10),
                   Row(
                     children: [
@@ -277,6 +283,95 @@ class _RemoteControlScreenState extends State<RemoteControlScreen> {
                     child: Text(_isConnected ? "DESCONECTAR" : "CONECTAR", style: const TextStyle(color: Colors.white)),
                   ),
                   
+                  const SizedBox(height: 30),
+                  const Divider(color: Colors.white24),
+                  const SizedBox(height: 20),
+
+                  const Text("HARDWARE PTZ (ESP32 MAESTRO)", style: TextStyle(color: Colors.orangeAccent, fontWeight: FontWeight.bold)),
+                  const SizedBox(height: 10),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: DropdownButton<String>(
+                          dropdownColor: Colors.black87,
+                          isExpanded: true,
+                          style: const TextStyle(color: Colors.white),
+                          hint: const Text("Puerto COM", style: TextStyle(color: Colors.white54)),
+                          value: _selectedComPort,
+                          items: _serialService.getAvailablePorts().map((port) {
+                            return DropdownMenuItem(value: port, child: Text(port));
+                          }).toList(),
+                          onChanged: _isSerialConnected ? null : (val) => setState(() => _selectedComPort = val),
+                        ),
+                      ),
+                      const SizedBox(width: 10),
+                      IconButton(
+                        onPressed: () => setState(() {}),
+                        icon: const Icon(Icons.refresh, color: Colors.white54),
+                        tooltip: "Escanear puertos",
+                      )
+                    ],
+                  ),
+                  const SizedBox(height: 10),
+                  ElevatedButton(
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: _isSerialConnected ? Colors.redAccent : Colors.orangeAccent,
+                      padding: const EdgeInsets.symmetric(vertical: 15),
+                    ),
+                    onPressed: () {
+                      if (_isSerialConnected) {
+                        _serialService.disconnect();
+                        setState(() => _isSerialConnected = false);
+                      } else if (_selectedComPort != null) {
+                        final success = _serialService.connect(_selectedComPort!);
+                        setState(() => _isSerialConnected = success);
+                      }
+                    },
+                    child: Text(_isSerialConnected ? "DESCONECTAR ESP32" : "CONECTAR ESP32", style: const TextStyle(color: Colors.white)),
+                  ),
+
+                  if (_isSerialConnected) ...[
+                    const SizedBox(height: 20),
+                    Center(
+                      child: Column(
+                        children: [
+                          _buildPtzButton(
+                            icon: Icons.keyboard_arrow_up,
+                            command: "TILT",
+                            action: "UP",
+                          ),
+                          Row(
+                            mainAxisAlignment: MainAxisAlignment.center,
+                            children: [
+                              _buildPtzButton(
+                                icon: Icons.keyboard_arrow_left,
+                                command: "PAN",
+                                action: "LEFT",
+                              ),
+                              const SizedBox(width: 20),
+                              IconButton(
+                                icon: const Icon(Icons.center_focus_strong, size: 30, color: Colors.orangeAccent),
+                                onPressed: () => _serialService.sendCommand("PTZ:CENTER"),
+                                tooltip: "Ir al Centro (Homing)",
+                              ),
+                              const SizedBox(width: 20),
+                              _buildPtzButton(
+                                icon: Icons.keyboard_arrow_right,
+                                command: "PAN",
+                                action: "RIGHT",
+                              ),
+                            ],
+                          ),
+                          _buildPtzButton(
+                            icon: Icons.keyboard_arrow_down,
+                            command: "TILT",
+                            action: "DOWN",
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+
                   const SizedBox(height: 30),
                   const Divider(color: Colors.white24),
                   const SizedBox(height: 20),
@@ -329,12 +424,27 @@ class _RemoteControlScreenState extends State<RemoteControlScreen> {
             )
           ],
         ),
-      ),
     );
   }
 
   String _selectedRes = 'max';
   String _selectedFps = '30';
+
+  Widget _buildPtzButton({required IconData icon, required String command, required String action}) {
+    return GestureDetector(
+      onTapDown: (_) => _serialService.sendCommand("$command:$action"),
+      onTapUp: (_) => _serialService.sendCommand("$command:STOP"),
+      onTapCancel: () => _serialService.sendCommand("$command:STOP"),
+      child: Container(
+        padding: const EdgeInsets.all(12),
+        decoration: BoxDecoration(
+          color: Colors.white10,
+          borderRadius: BorderRadius.circular(12),
+        ),
+        child: Icon(icon, size: 36, color: Colors.white),
+      ),
+    );
+  }
 
   Widget _buildControlCard({required String title, required IconData icon, required VoidCallback onTap}) {
     return InkWell(

@@ -45,6 +45,7 @@ dependencies:
   web_socket_channel: ^3.0.3
   nsd: ^5.0.1
   flutter_foreground_task: ^10.0.0
+  flutter_libserialport: ^0.6.0
 
 dev_dependencies:
   flutter_test:
